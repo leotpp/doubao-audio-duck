@@ -1,12 +1,32 @@
 # 豆包输入法语音闪避 · Doubao Audio Duck
 
-一个面向 macOS 的豆包输入法语音输入辅助工具：豆包开始识别语音时，自动静音系统输出；识别结束后恢复原来的静音状态，减少扬声器声音被麦克风重新录入造成的误识别。
+> **豆包语音输入时，番剧对白、音乐、说唱也被麦克风一起听进去了？**
+>
+> **When using Doubao voice input on Mac, does anime dialogue, music, or rap get picked up by the microphone too?**
 
-An unofficial macOS helper for Doubao Input Method. While Doubao is recording speech, it mutes system output and restores the previous mute state shortly after recording ends, helping prevent speaker audio from leaking back into microphone recognition.
+豆包输入法的语音识别很快，但在 macOS 上语音输入时不会自动闪避系统声音。你一边播放番剧、音乐、播客或视频，一边按住 Fn 说话，扬声器里的声音可能会被麦克风重新拾取，干扰识别结果。
+
+Doubao Input Method is fast, but it does not automatically duck system audio during voice typing on macOS. If you play anime, music, podcasts, or videos while holding Fn to speak, the microphone may capture that playback and interfere with recognition.
+
+**Doubao Audio Duck** 解决的就是这个问题：检测到豆包正在语音输入时，自动静音整个 macOS 系统输出；松开按键、识别结束后，再恢复声音。它不会暂停视频，也不会改变播放进度。
+
+**Doubao Audio Duck** addresses this gap: when Doubao voice input is detected, it automatically mutes macOS system output and restores audio after recording ends. It does not pause videos or change playback position.
+
+这是一个针对真实使用痛点制作的个人工具，当前实现主要基于我的 Mac 和豆包版本验证，不保证适配所有 macOS、豆包版本和硬件组合。如果你也遇到同样的干扰，欢迎试用、反馈和改进。
+
+This is a small personal tool built around a real-world annoyance. The current implementation has mainly been tested with the author's Mac and Doubao version, so compatibility with every macOS release, Doubao version, and hardware setup is not guaranteed. If you have the same problem, try it, report issues, and help improve it.
 
 > 本项目与字节跳动、豆包输入法或其开发团队无关。
 >
 > This project is not affiliated with ByteDance or the Doubao Input Method team.
+
+**搜索关键词 / Search terms:** 豆包输入法、Mac 语音输入、macOS 语音识别、麦克风干扰、系统声音静音、录音时静音、音频闪避、番剧、音乐、说唱、视频播放；Doubao Input Method, macOS voice typing, dictation, microphone interference, mute system audio while recording, audio ducking, anime, music, rap, video playback.
+
+## 一句话了解 · In one sentence
+
+播放番剧、音乐或视频时，用豆包输入法按住 Fn 说话；本工具会在录音期间静音系统声音，避免播放内容被麦克风拾取。
+
+Play anime, music, or video while using Doubao voice input; this helper mutes system output during recording so playback is not picked up by the microphone.
 
 ## 功能亮点 · Features
 
