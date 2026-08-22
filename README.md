@@ -8,9 +8,9 @@
 
 Doubao Input Method is fast, but it does not automatically duck system audio during voice typing on macOS. If you play anime, music, podcasts, or videos while holding Fn to speak, the microphone may capture that playback and interfere with recognition.
 
-**Doubao Audio Duck** 解决的就是这个问题：检测到豆包正在语音输入时，自动静音整个 macOS 系统输出；松开按键、识别结束后，再恢复声音。它不会暂停视频，也不会改变播放进度。
+**Doubao Audio Duck** 解决的就是这个问题：在**按住 Fn 拉起豆包语音**时自动静音整个 macOS 系统输出；松开按键、识别结束后，再恢复声音。它不会暂停视频，也不会改变播放进度。空闲时贴在屏幕右缘的语音条、以及豆包自己闪动的采麦标志，都不会静音。
 
-**Doubao Audio Duck** addresses this gap: when Doubao voice input is detected, it automatically mutes macOS system output and restores audio after recording ends. It does not pause videos or change playback position.
+**Doubao Audio Duck** addresses this gap: while you **hold Fn to start Doubao voice input**, it automatically mutes macOS system output and restores audio after recording ends. It does not pause videos or change playback position. An idle voice bar parked against a screen's right edge, and Doubao's own flickering capture flag, will not mute audio.
 
 这是一个针对真实使用痛点制作的个人工具，当前实现主要基于我的 Mac 和豆包版本验证，不保证适配所有 macOS、豆包版本和硬件组合。如果你也遇到同样的干扰，欢迎试用、反馈和改进。
 
@@ -30,33 +30,33 @@ Play anime, music, or video while using Doubao voice input; this helper mutes sy
 
 ## 功能亮点 · Features
 
-- 仅在检测到豆包语音输入时闪避系统输出，空闲时不影响声音。
-- 同时覆盖三种检测信号：Fn 按住、豆包语音浮层、Core Audio 录音状态。
+- **只有按住 Fn 才会开始静音**；空闲时贴在屏幕右缘的语音条、以及豆包自己闪动的采麦标志，都不会单独静音。
+- Fn 启动后，未贴边的语音浮层或稳定的 Core Audio 采集可维持静音（覆盖双击 Fn 持续录音）。
 - 使用 macOS 系统级输出静音，因此 Safari、Chrome、视频播放器和其他应用都会暂时静音。
-- 结束录音后约 0.35 秒恢复，避免松键瞬间“闪回”一声。
+- 结束录音后约 1 秒恢复，避免松键或浮层抖动时把 AirPlay 掐断又接上。
 - 如果开始录音前系统已经静音，结束时不会擅自取消静音。
 - 以 Swift 单文件实现，安装脚本会在当前 Mac 上重新编译，兼容 Apple Silicon 与 Intel 的本机编译流程。
 
-- Docks system output only while Doubao voice input is detected.
-- Uses three detection signals: held Fn key, the visible Doubao recording overlay, and Core Audio input activity.
+- **Mute starts only when Fn is held**; an idle bar parked against a screen's right edge, and Doubao's flickering capture flag, cannot start a duck on their own.
+- After Fn starts a duck, a non-parked recording overlay or stable Core Audio capture can keep it (covers double-tap Fn continuous recording).
 - Because it uses system-level output mute, Safari, Chrome, media players, and other apps are muted together.
-- Restores audio about 0.35 seconds after recording ends to avoid a brief sound leak.
+- Restores audio about 1 second after recording ends to avoid chopping AirPlay streams.
 - Preserves a mute state that was already enabled before recording.
 - Implemented as a single Swift source file; the installer compiles a native binary on the current Mac for Apple Silicon or Intel.
 
 ## 工作方式 · How it works
 
-程序每约 80 ms 检查以下信号，命中任意一个就进入闪避状态：
+程序每约 80 ms 检查 Fn；另外两个信号只用来**维持**已经开始的静音，不能单独启动：
 
-1. 当前输入法是豆包，并且 Fn 按住约 240 ms；短暂的 Fn+亮度按键不会触发。
-2. 豆包的高层级语音浮层真正显示在屏幕上；停在屏幕外的隐藏候选/浮层不会触发。
-3. Core Audio 将豆包输入法进程标记为正在采集输入。这个信号在部分版本中不稳定，因此只作为补充。
+1. **启动：** 当前输入法是豆包，并且 Fn 按住约 240 ms；短暂的 Fn+亮度按键不会触发。没按 Fn 就绝不静音。
+2. **维持：** 未贴边的高层级语音浮层。豆包空闲时会把语音条**齐着屏幕右缘停着**（宽屏上完全可见），这条不算录音。
+3. **维持：** Core Audio 将豆包输入法进程标记为正在采集输入，且连续约 320 ms。输入法会在没录音时闪这个位，所以不能用来启动。
 
-The daemon checks these signals roughly every 80 ms and ducks audio when any one is active:
+The daemon checks Fn roughly every 80 ms. Overlay and HAL only **sustain** an already-started duck; they cannot start one:
 
-1. Doubao is the current input source and the Fn key has been held for about 240 ms. Brief Fn+brightness taps are ignored.
-2. Doubao's high-level recording overlay is visibly present on a display; parked-off-screen windows are ignored.
-3. Core Audio reports the Doubao process as capturing input. This signal is unreliable on some versions and is used as a supplement.
+1. **Start:** Doubao is the current input source and the Fn key has been held for about 240 ms. Brief Fn+brightness taps are ignored. No Fn, no mute.
+2. **Sustain:** Doubao's high-level recording overlay is on a display and **not** parked flush with a screen's right edge. The idle 643×77 bar sits at that edge and is ignored.
+3. **Sustain:** Core Audio reports the Doubao process as capturing input for about 320 ms. That bit flickers without recording, so it cannot start a duck.
 
 闪避使用的是系统输出静音，不是暂停媒体。因此视频或网页会继续播放，只是暂时没有声音。
 
@@ -114,9 +114,9 @@ The script is safe to run again; it stops the existing service, recompiles the b
 
 ## 使用与自检 · Usage and diagnostics
 
-安装完成后，打开网页音乐或视频，切换到豆包输入法并按住默认的 Fn 语音快捷键。录音期间系统输出会静音，松开后约 0.35 秒恢复。
+安装完成后，打开网页音乐或视频，切换到豆包输入法并按住默认的 Fn 语音快捷键。录音期间系统输出会静音，松开后约 1 秒恢复。
 
-After installation, play a web page or video, select Doubao, and hold its default Fn voice shortcut. System output should mute during recording and return about 0.35 seconds after release.
+After installation, play a web page or video, select Doubao, and hold its default Fn voice shortcut. System output should mute during recording and return about 1 second after release.
 
 查看检测状态：
 
@@ -156,9 +156,9 @@ cat /tmp/doubao-audio-duck.status
 tail -30 ~/Library/Logs/doubao-audio-duck.log
 ```
 
-录音期间状态文件通常会显示 `ducked fn`、`ducked overlay[…]` 或其他 `ducked …` 状态；空闲时为 `idle`。
+录音期间状态文件通常会显示 `ducked fn`；空闲时为 `idle`。不应再出现空闲时的 `ducked overlay[…]` 或单独的 `ducked hal`。
 
-During recording, the status file normally contains `ducked fn`, `ducked overlay[…]`, or another `ducked …` value. It is `idle` when inactive.
+During recording, the status file normally contains `ducked fn`. It is `idle` when inactive. Idle `ducked overlay[…]` or a lone `ducked hal` should no longer appear.
 
 ## 安装后文件 · Installed files
 
@@ -203,14 +203,14 @@ After modifying `main.swift`, run the installer again to rebuild and restart:
 ## 限制与隐私 · Limitations and privacy
 
 - 这是针对豆包输入法的非官方辅助工具，不处理微信输入法、Zoom 或其他应用的录音。
-- 如果把豆包快捷键改成非 Fn 按键，Fn 检测会失效；浮层或 Core Audio 检测仍可能有效。
+- 如果把豆包快捷键改成非 Fn 按键，本工具不会再自动静音（浮层和 Core Audio 不能单独启动闪避）。
 - 它会静音所有系统输出，而不是只暂停某一个应用；请确认这正是你想要的行为。
 - 进程不读取键盘输入内容，只读取 Fn 修饰键状态、当前输入源、窗口几何信息和 Core Audio 进程状态。
 - 如果程序异常退出后声音仍被静音，可先执行 `osascript -e 'set volume without output muted'`，再查看日志或运行卸载脚本。
 - 每个 macOS 用户都需要分别运行一次安装脚本。
 
 - This is an unofficial helper for Doubao Input Method. It does not handle WeChat Input Method, Zoom, or other recording applications.
-- If Doubao's shortcut is changed to a non-Fn key, Fn detection will no longer work; overlay or Core Audio detection may still work.
+- If Doubao's shortcut is changed to a non-Fn key, this helper will no longer start ducking (overlay and Core Audio cannot start a duck on their own).
 - It mutes all system output rather than pausing one application, so make sure that behavior fits your workflow.
 - It does not read keyboard contents. It only inspects Fn modifier state, the current input source, window geometry, and Core Audio process state.
 - If an abnormal exit leaves audio muted, run `osascript -e 'set volume without output muted'`, then inspect the logs or run the uninstall script.

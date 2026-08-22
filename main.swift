@@ -31,7 +31,6 @@ private func log(_ msg: String) {
             try? data.write(to: URL(fileURLWithPath: logPath))
         }
     }
-    fputs(line, stderr)
 }
 
 private func writeStatus(_ s: String) {
@@ -157,8 +156,23 @@ private func windowVisibleOnAScreen(_ cgRect: CGRect) -> Bool {
     return false
 }
 
+/// Doubao parks the idle voice bar flush against a display's right edge
+/// (x ≈ screenMaxX − width), not past it. On a 2560-wide panel that is
+/// around x=1917 and looks fully on-screen, which used to false-trigger ducking.
+private func overlayParkedAgainstRightEdge(_ cgRect: CGRect) -> Bool {
+    for screen in NSScreen.screens {
+        let maxX = screen.frame.maxX
+        let minX = screen.frame.minX
+        let flush = maxX - cgRect.width
+        if abs(cgRect.origin.x - flush) <= 48 { return true }
+        if cgRect.origin.x >= maxX - 24 { return true }
+        if cgRect.maxX <= minX + 24 { return true }
+    }
+    return false
+}
+
 /// Doubao's voice overlay uses a very high window layer; the typing candidate bar does not.
-/// Idle, that overlay is parked just past the right edge (seen at x=screenWidth).
+/// Idle, that overlay sits flush with a screen's right edge — that is not recording.
 private func doubaoRecordingOverlayVisible() -> (Bool, String) {
     guard let info = CGWindowListCopyWindowInfo(
         [.optionAll, .excludeDesktopElements],
@@ -174,6 +188,7 @@ private func doubaoRecordingOverlayVisible() -> (Bool, String) {
         let bounds = win[kCGWindowBounds as String] as? [String: Any] ?? [:]
         let rect = cgWindowRect(bounds)
         guard layer >= 100 && rect.width >= 180 && rect.height >= 40 else { continue }
+        if overlayParkedAgainstRightEdge(rect) { continue }
         if windowVisibleOnAScreen(rect) {
             return (true, "layer=\(layer) \(Int(rect.width))x\(Int(rect.height)) @\(Int(rect.origin.x)),\(Int(rect.origin.y))")
         }
@@ -207,11 +222,12 @@ private final class DuckController {
     private var mutedBefore = false
     private var lastActive = false
     private var restoreWork: DispatchWorkItem?
-    private let restoreDelay: TimeInterval = 0.35
+    private let restoreDelay: TimeInterval = 1.0
     private var lastNote = ""
     private var fnHoldTicks = 0
     private var fnOnlyTicks = 0
     private var overlayTicks = 0
+    private var halTicks = 0
 
     /// Last-resort restore used on SIGTERM/SIGINT so a killed daemon
     /// never leaves the system muted. Runs before exit.
@@ -225,14 +241,6 @@ private final class DuckController {
     }
 
     func tick() {
-        let (overlayNow, overlayInfo) = doubaoRecordingOverlayVisible()
-        if overlayNow {
-            overlayTicks += 1
-        } else {
-            overlayTicks = 0
-        }
-        let overlay = overlayTicks >= 2
-        let hal = doubaoHALCapturing()
         if fnHeld() && currentInputSourceIsDoubao() {
             fnHoldTicks += 1
         } else {
@@ -248,15 +256,43 @@ private final class DuckController {
         }
         // ~240ms of Fn hold while Doubao is the IME. Ignores Fn+brightness taps.
         let fn = fnHoldTicks >= 3
-        let active = overlay || hal || fn
+
+        // Overlay / HAL are sustain-only. They must not start a duck on their own:
+        // the idle voice bar parks on-screen, and Doubao flickers IsRunningInput
+        // without the user recording. Skip the expensive probes while idle.
+        var overlay = false
+        var overlayInfo = ""
+        var hal = false
+        if duckedByUs {
+            let (overlayNow, info) = doubaoRecordingOverlayVisible()
+            overlayInfo = info
+            if overlayNow {
+                overlayTicks += 1
+            } else {
+                overlayTicks = 0
+            }
+            overlay = overlayTicks >= 2
+            if doubaoHALCapturing() {
+                halTicks += 1
+            } else {
+                halTicks = 0
+            }
+            // ~320ms of stable HAL capture, so a one-tick flicker cannot hold mute.
+            hal = halTicks >= 4
+        } else {
+            overlayTicks = 0
+            halTicks = 0
+        }
+
+        let active = fn || (duckedByUs && (overlay || hal))
         if active {
             restoreWork?.cancel()
             restoreWork = nil
             if !lastActive {
                 var parts: [String] = []
+                if fn { parts.append("fn") }
                 if overlay { parts.append("overlay[\(overlayInfo)]") }
                 if hal { parts.append("hal") }
-                if fn { parts.append("fn") }
                 applyDuck(true, reason: parts.joined(separator: "+"))
             }
             lastActive = true
@@ -303,6 +339,7 @@ private func dumpDebug() {
     print("doubaoHALCapturing=\(doubaoHALCapturing())")
     let overlay = doubaoRecordingOverlayVisible()
     print("doubaoRecordingOverlayVisible=\(overlay.0) \(overlay.1)")
+    print("(recording overlay ignores bars parked flush with a screen's right edge)")
     print("currentInputSourceIsDoubao=\(currentInputSourceIsDoubao())")
     print("fnHeld=\(fnHeld())")
     print("process objects:")
