@@ -247,23 +247,18 @@ private final class DuckController {
             fnHoldTicks = 0
             fnOnlyTicks = 0
         }
-        // Fn must be corroborated by the overlay or mic capture within
-        // fnConfirmTicks (~640ms); a real press-and-hold always is, while the
-        // occasional spurious maskSecondaryFn report never sees one.
-        let confirmed = overlay || hal
-        if !confirmed && fnHoldTicks > DuckController.fnConfirmTicks {
-            return
-        }
         // ~240ms of Fn hold while Doubao is the IME. Ignores Fn+brightness taps.
         let fn = fnHoldTicks >= 3
 
         // Overlay / HAL are sustain-only. They must not start a duck on their own:
         // the idle voice bar parks on-screen, and Doubao flickers IsRunningInput
-        // without the user recording. Skip the expensive probes while idle.
+        // without the user recording. Probe while ducked as before, and also while
+        // Fn is on probation so a real press can be corroborated.
         var overlay = false
         var overlayInfo = ""
         var hal = false
-        if duckedByUs {
+        let probing = duckedByUs || (fn && fnHoldTicks <= DuckController.fnConfirmTicks)
+        if probing {
             let (overlayNow, info) = doubaoRecordingOverlayVisible()
             overlayInfo = info
             if overlayNow {
@@ -282,6 +277,13 @@ private final class DuckController {
         } else {
             overlayTicks = 0
             halTicks = 0
+        }
+
+        // Spurious maskSecondaryFn reports happen without any key press. A real
+        // press-and-hold always brings up the overlay or mic capture within
+        // ~640ms; a phantom Fn flag never does, so drop it instead of muting.
+        if !duckedByUs && !overlay && !hal && fnHoldTicks > DuckController.fnConfirmTicks {
+            return
         }
 
         let active = fn || (duckedByUs && (overlay || hal))
