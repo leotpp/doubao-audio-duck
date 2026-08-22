@@ -193,6 +193,16 @@ private func fnHeld() -> Bool {
 }
 
 private final class DuckController {
+    /// Fn alone is put on probation: it must be corroborated by the overlay or
+    /// mic-capture signal within this many ticks (~80ms each) or it is treated
+    /// as a spurious maskSecondaryFn report and dropped. Override with the
+    /// DUCK_FN_CONFIRM_TICKS environment variable.
+    static let fnConfirmTicks: Int = {
+        if let s = ProcessInfo.processInfo.environment["DUCK_FN_CONFIRM_TICKS"],
+           let n = Int(s), n > 0 { return n }
+        return 8
+    }()
+
     private var duckedByUs = false
     private var mutedBefore = false
     private var lastActive = false
@@ -200,7 +210,19 @@ private final class DuckController {
     private let restoreDelay: TimeInterval = 0.35
     private var lastNote = ""
     private var fnHoldTicks = 0
+    private var fnOnlyTicks = 0
     private var overlayTicks = 0
+
+    /// Last-resort restore used on SIGTERM/SIGINT so a killed daemon
+    /// never leaves the system muted. Runs before exit.
+    func emergencyRestore(_ why: String) {
+        if duckedByUs && !mutedBefore {
+            setSystemMuted(false)
+        }
+        writeStatus("idle")
+        log("emergency restore (\(why)) duckedByUs=\(duckedByUs) mutedBefore=\(mutedBefore)")
+        exit(0)
+    }
 
     func tick() {
         let (overlayNow, overlayInfo) = doubaoRecordingOverlayVisible()
@@ -215,6 +237,14 @@ private final class DuckController {
             fnHoldTicks += 1
         } else {
             fnHoldTicks = 0
+            fnOnlyTicks = 0
+        }
+        // Fn must be corroborated by the overlay or mic capture within
+        // fnConfirmTicks (~640ms); a real press-and-hold always is, while the
+        // occasional spurious maskSecondaryFn report never sees one.
+        let confirmed = overlay || hal
+        if !confirmed && fnHoldTicks > DuckController.fnConfirmTicks {
+            return
         }
         // ~240ms of Fn hold while Doubao is the IME. Ignores Fn+brightness taps.
         let fn = fnHoldTicks >= 3
@@ -230,6 +260,11 @@ private final class DuckController {
                 applyDuck(true, reason: parts.joined(separator: "+"))
             }
             lastActive = true
+            if active == fn && !(overlay || hal) {
+                fnOnlyTicks += 1
+            } else {
+                fnOnlyTicks = 0
+            }
         } else if lastActive {
             lastActive = false
             let work = DispatchWorkItem { [weak self] in
@@ -308,6 +343,18 @@ private func acquireSingletonLock() {
 private func runDaemon() {
     acquireSingletonLock()
     log("started pid=\(ProcessInfo.processInfo.processIdentifier)")
+    // A previous instance may have been killed mid-duck and left the system
+    // muted. If Doubao shows no recording activity right now, unmute once.
+    if isSystemMuted() {
+        let overlay = doubaoRecordingOverlayVisible().0
+        let hal = doubaoHALCapturing()
+        if !overlay && !hal && !fnHeld() {
+            setSystemMuted(false)
+            log("startup: found system muted with no Doubao activity; unmuted")
+        } else {
+            log("startup: system muted, but Doubao appears active; leaving as-is")
+        }
+    }
     writeStatus("idle")
     let duck = DuckController()
 
@@ -332,6 +379,18 @@ private func runDaemon() {
         duck.tick()
     }
     RunLoop.main.add(timer, forMode: .common)
+
+    // If launchd kills or restarts us mid-duck, unmute before dying so the
+    // system never stays silently muted by a dead daemon.
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let srcTerm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    srcTerm.setEventHandler { duck.emergencyRestore("SIGTERM") }
+    srcTerm.resume()
+    let srcInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    srcInt.setEventHandler { duck.emergencyRestore("SIGINT") }
+    srcInt.resume()
+
     RunLoop.main.run()
 }
 
