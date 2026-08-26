@@ -12,6 +12,11 @@ import Darwin
 private let doubaoBundleID = "com.bytedance.inputmethod.doubaoime"
 private let logPath = NSHomeDirectory() + "/Library/Logs/doubao-audio-duck.log"
 private let statusPath = "/tmp/doubao-audio-duck.status"
+private let logDateFormatter: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}()
 
 private let kProcessObjectList: AudioObjectPropertySelector = 0x70727323 // 'prs#'
 private let kProcessPID: AudioObjectPropertySelector = 0x70706964        // 'ppid'
@@ -19,7 +24,7 @@ private let kProcessBundleID: AudioObjectPropertySelector = 0x70626964   // 'pbi
 private let kProcessIsRunningInput: AudioObjectPropertySelector = 0x70697269 // 'piri'
 
 private func log(_ msg: String) {
-    let line = ISO8601DateFormatter().string(from: Date()) + "  " + msg + "\n"
+    let line = logDateFormatter.string(from: Date()) + "  " + msg + "\n"
     if let data = line.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: logPath) {
             if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
@@ -37,34 +42,51 @@ private func writeStatus(_ s: String) {
     try? (s + "\n").write(toFile: statusPath, atomically: true, encoding: .utf8)
 }
 
-private func osascript(_ source: String) -> String {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", source]
-    let out = Pipe()
-    p.standardOutput = out
-    p.standardError = Pipe()
-    do {
-        try p.run()
-        p.waitUntilExit()
-    } catch {
-        return ""
-    }
-    let data = out.fileHandleForReading.readDataToEndOfFile()
-    return String(data: data, encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+private func defaultOutputDevice() -> AudioDeviceID? {
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var device: AudioDeviceID = kAudioObjectUnknown
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(system, &address, 0, nil, &size, &device)
+    return status == noErr && device != kAudioObjectUnknown ? device : nil
 }
 
-private func isSystemMuted() -> Bool {
-    osascript("output muted of (get volume settings)").lowercased().hasPrefix("t")
+private func outputMuteAddress() -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyMute,
+        mScope: kAudioDevicePropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain
+    )
 }
 
-private func setSystemMuted(_ muted: Bool) {
-    if muted {
-        _ = osascript("set volume with output muted")
-    } else {
-        _ = osascript("set volume without output muted")
+private func systemMuteState() -> Bool? {
+    guard let device = defaultOutputDevice() else { return nil }
+    var address = outputMuteAddress()
+    var muted: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &muted)
+    return status == noErr ? muted != 0 : nil
+}
+
+@discardableResult
+private func setSystemMuted(_ muted: Bool) -> Bool {
+    guard let device = defaultOutputDevice() else {
+        log("output mute unavailable: no default output device")
+        return false
     }
+    var address = outputMuteAddress()
+    var value: UInt32 = muted ? 1 : 0
+    let size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectSetPropertyData(device, &address, 0, nil, size, &value)
+    if status != noErr {
+        log("output mute failed muted=\(muted) status=\(status)")
+        return false
+    }
+    return true
 }
 
 private func audioUInt32(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
@@ -114,7 +136,9 @@ private func doubaoHALCapturing() -> Bool {
     for id in processObjectIDs() {
         let bid = audioString(id, kProcessBundleID) ?? ""
         if bid == doubaoBundleID {
-            return (audioUInt32(id, kProcessIsRunningInput) ?? 0) != 0
+            if (audioUInt32(id, kProcessIsRunningInput) ?? 0) != 0 {
+                return true
+            }
         }
     }
     return false
@@ -203,147 +227,374 @@ private func currentInputSourceIsDoubao() -> Bool {
     return bid == doubaoBundleID
 }
 
-private func fnHeld() -> Bool {
+private func monotonicNanoseconds() -> UInt64 {
+    DispatchTime.now().uptimeNanoseconds
+}
+
+private func durationMilliseconds(_ nanoseconds: UInt64) -> Int {
+    Int(nanoseconds / 1_000_000)
+}
+
+private struct FnHoldGate {
+    enum Event {
+        case pressed(generation: UInt64)
+        case released(generation: UInt64, durationNanoseconds: UInt64)
+    }
+
+    let thresholdNanoseconds: UInt64
+    private(set) var held = false
+    private(set) var generation: UInt64 = 0
+    private var pressedAt: UInt64?
+
+    init(thresholdNanoseconds: UInt64) {
+        self.thresholdNanoseconds = thresholdNanoseconds
+        self.pressedAt = nil
+    }
+
+    mutating func update(held: Bool, at now: UInt64) -> Event? {
+        guard held != self.held else { return nil }
+        self.held = held
+        generation &+= 1
+        if held {
+            pressedAt = now
+            return .pressed(generation: generation)
+        }
+
+        let duration = pressedAt.map { now >= $0 ? now - $0 : 0 } ?? 0
+        pressedAt = nil
+        return .released(generation: generation, durationNanoseconds: duration)
+    }
+
+    func shouldArm(generation: UInt64, at now: UInt64) -> Bool {
+        guard held, self.generation == generation, let pressedAt else { return false }
+        return now >= pressedAt && now - pressedAt >= thresholdNanoseconds
+    }
+}
+
+private let kVKFunction: Int64 = 0x3F
+
+private func hardwareFnHeld() -> Bool {
     CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
 }
 
+private final class FnEventMonitor {
+    private let onChange: (Bool) -> Void
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var lastFnHeld = false
+
+    init(onChange: @escaping (Bool) -> Void) {
+        self.onChange = onChange
+    }
+
+    func start() -> Bool {
+        let mask = CGEventMask(
+            (1 << CGEventType.flagsChanged.rawValue)
+            | (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue)
+        )
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            guard let userInfo else { return Unmanaged.passUnretained(event) }
+            let monitor = Unmanaged<FnEventMonitor>.fromOpaque(userInfo).takeUnretainedValue()
+
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = monitor.eventTap {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                    log("Fn event tap re-enabled after type=\(type.rawValue)")
+                }
+            } else if type == .flagsChanged || type == .keyDown || type == .keyUp {
+                monitor.handle(event, type: type)
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        let userInfo = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: userInfo
+        ) else {
+            log("Fn event tap unavailable; hid-state polling remains the source of truth")
+            return false
+        }
+
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            log("Fn event tap run-loop source unavailable")
+            return false
+        }
+        eventTap = tap
+        runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        log("Fn event tap started")
+        return true
+    }
+
+    private func handle(_ event: CGEvent, type: CGEventType) {
+        var held = event.flags.contains(.maskSecondaryFn)
+        let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+        if keycode == kVKFunction {
+            if type == .keyDown { held = true }
+            if type == .keyUp { held = false }
+        }
+        guard held != lastFnHeld else { return }
+        lastFnHeld = held
+        onChange(held)
+    }
+}
+
 private final class DuckController {
-    /// Fn alone is put on probation: it must be corroborated by the overlay or
-    /// mic-capture signal within this many ticks (~80ms each) or it is treated
-    /// as a spurious maskSecondaryFn report and dropped. Override with the
-    /// DUCK_FN_CONFIRM_TICKS environment variable.
-    static let fnConfirmTicks: Int = {
-        if let s = ProcessInfo.processInfo.environment["DUCK_FN_CONFIRM_TICKS"],
-           let n = Int(s), n > 0 { return n }
-        return 8
+    /// The hold threshold is measured from the actual Fn-down event, not from
+    /// how many times a timer or notification happened to call into the state
+    /// machine. Override with DUCK_FN_HOLD_MS for hardware-specific tuning.
+    static let fnHoldMilliseconds: Int = {
+        if let s = ProcessInfo.processInfo.environment["DUCK_FN_HOLD_MS"],
+           let n = Int(s), (100...2_000).contains(n) {
+            return n
+        }
+        return 300
     }()
 
+    private static let fnHoldNanoseconds = UInt64(fnHoldMilliseconds) * 1_000_000
     private var duckedByUs = false
     private var mutedBefore = false
-    private var lastActive = false
+    private var fnGate = FnHoldGate(thresholdNanoseconds: DuckController.fnHoldNanoseconds)
+    private var holdWork: DispatchWorkItem?
     private var restoreWork: DispatchWorkItem?
     private let restoreDelay: TimeInterval = 1.0
-    private var lastNote = ""
-    private var fnHoldTicks = 0
-    private var fnOnlyTicks = 0
-    private var overlayTicks = 0
-    private var halTicks = 0
+    private let sustainStableNanoseconds: UInt64 = 320_000_000
+    private var overlayStartedAt: UInt64?
+    private var halStartedAt: UInt64?
+    private var overlayInfo = ""
+    private var sustainActive = false
+    /// Short Fn taps never cross the hold threshold. Keep a window so the
+    /// recording overlay / HAL capture that follows a click can start the duck.
+    private var fnCorroborationDeadline: UInt64 = 0
+    private static let fnCorroborationNanoseconds: UInt64 = 1_200_000_000
 
     /// Last-resort restore used on SIGTERM/SIGINT so a killed daemon
     /// never leaves the system muted. Runs before exit.
     func emergencyRestore(_ why: String) {
+        holdWork?.cancel()
+        restoreWork?.cancel()
         if duckedByUs && !mutedBefore {
-            setSystemMuted(false)
+            _ = setSystemMuted(false)
         }
         writeStatus("idle")
         log("emergency restore (\(why)) duckedByUs=\(duckedByUs) mutedBefore=\(mutedBefore)")
         exit(0)
     }
 
-    func tick() {
-        if fnHeld() && currentInputSourceIsDoubao() {
-            fnHoldTicks += 1
-        } else {
-            fnHoldTicks = 0
-            fnOnlyTicks = 0
-        }
-        // ~240ms of Fn hold while Doubao is the IME. Ignores Fn+brightness taps.
-        let fn = fnHoldTicks >= 3
+    func handleFnChanged(_ held: Bool, source: String) {
+        let now = monotonicNanoseconds()
+        guard let event = fnGate.update(held: held, at: now) else { return }
 
-        // Overlay / HAL are sustain-only. They must not start a duck on their own:
-        // the idle voice bar parks on-screen, and Doubao flickers IsRunningInput
-        // without the user recording. Probe while ducked as before, and also while
-        // Fn is on probation so a real press can be corroborated.
-        var overlay = false
-        var overlayInfo = ""
-        var hal = false
-        let probing = duckedByUs || (fn && fnHoldTicks <= DuckController.fnConfirmTicks)
-        if probing {
-            let (overlayNow, info) = doubaoRecordingOverlayVisible()
+        holdWork?.cancel()
+        holdWork = nil
+
+        switch event {
+        case .pressed(let generation):
+            // A re-press cancels a pending restore immediately, rather than
+            // waiting for the new hold to cross the 300ms start threshold.
+            restoreWork?.cancel()
+            restoreWork = nil
+            fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
+            log("Fn down source=\(source) generation=\(generation)")
+
+            guard !duckedByUs else { return }
+            let work = DispatchWorkItem { [weak self] in
+                self?.armFn(generation: generation)
+            }
+            holdWork = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(DuckController.fnHoldMilliseconds),
+                execute: work
+            )
+
+        case .released(let generation, let durationNanoseconds):
+            fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
+            log("Fn up source=\(source) generation=\(generation) durationMs=\(durationMilliseconds(durationNanoseconds))")
+            if duckedByUs {
+                scheduleRestoreIfIdle(reason: "fn-up")
+            }
+        }
+    }
+
+    /// Overlay and HAL are corroboration/sustain signals. They cannot start a
+    /// duck on their own, but after a recent Fn press they can — that covers
+    /// a click-to-record that never crosses the hold threshold.
+    func pollSustain() {
+        let now = monotonicNanoseconds()
+        let fnRecent = fnGate.held || now < fnCorroborationDeadline
+        guard duckedByUs || fnRecent else { return }
+
+        let (overlayNow, info) = doubaoRecordingOverlayVisible()
+        if overlayNow {
+            overlayStartedAt = overlayStartedAt ?? now
             overlayInfo = info
-            if overlayNow {
-                overlayTicks += 1
-            } else {
-                overlayTicks = 0
-            }
-            overlay = overlayTicks >= 2
-            if doubaoHALCapturing() {
-                halTicks += 1
-            } else {
-                halTicks = 0
-            }
-            // ~320ms of stable HAL capture, so a one-tick flicker cannot hold mute.
-            hal = halTicks >= 4
         } else {
-            overlayTicks = 0
-            halTicks = 0
+            overlayStartedAt = nil
+            overlayInfo = ""
         }
 
-        // Spurious maskSecondaryFn reports happen without any key press. A real
-        // press-and-hold always brings up the overlay or mic capture within
-        // ~640ms; a phantom Fn flag never does, so drop it instead of muting.
-        if !duckedByUs && !overlay && !hal && fnHoldTicks > DuckController.fnConfirmTicks {
+        if doubaoHALCapturing() {
+            halStartedAt = halStartedAt ?? now
+        } else {
+            halStartedAt = nil
+        }
+
+        let overlayStable = isStable(since: overlayStartedAt, now: now)
+        let halStable = isStable(since: halStartedAt, now: now)
+        let newSustainActive = overlayStable || halStable
+        if newSustainActive != sustainActive {
+            sustainActive = newSustainActive
+            if newSustainActive {
+                let reason = overlayStable ? "overlay[\(overlayInfo)]" : "hal"
+                log("sustain on (\(reason))")
+            } else {
+                log("sustain off")
+            }
+        }
+
+        if !duckedByUs {
+            guard newSustainActive, currentInputSourceIsDoubao() else { return }
+            let reason = overlayStable ? "overlay[\(overlayInfo)]" : "hal"
+            applyDuck(true, reason: reason)
             return
         }
 
-        let active = fn || (duckedByUs && (overlay || hal))
-        if active {
+        if fnGate.held || sustainActive {
             restoreWork?.cancel()
             restoreWork = nil
-            if !lastActive {
-                var parts: [String] = []
-                if fn { parts.append("fn") }
-                if overlay { parts.append("overlay[\(overlayInfo)]") }
-                if hal { parts.append("hal") }
-                applyDuck(true, reason: parts.joined(separator: "+"))
-            }
-            lastActive = true
-            if active == fn && !(overlay || hal) {
-                fnOnlyTicks += 1
-            } else {
-                fnOnlyTicks = 0
-            }
-        } else if lastActive {
-            lastActive = false
-            let work = DispatchWorkItem { [weak self] in
-                self?.applyDuck(false, reason: "idle")
-            }
-            restoreWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay, execute: work)
+        } else {
+            scheduleRestoreIfIdle(reason: "idle")
         }
+    }
+
+    private func armFn(generation: UInt64) {
+        holdWork = nil
+        let now = monotonicNanoseconds()
+        guard fnGate.shouldArm(generation: generation, at: now) else { return }
+
+        guard currentInputSourceIsDoubao() else {
+            log("Fn hold ignored generation=\(generation): current input source is not Doubao")
+            // The input source can change while Fn is held. Retry without
+            // counting callbacks as elapsed time, but never after release.
+            guard fnGate.held else { return }
+            let work = DispatchWorkItem { [weak self] in
+                self?.armFn(generation: generation)
+            }
+            holdWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100), execute: work)
+            return
+        }
+
+        applyDuck(true, reason: "fn-\(DuckController.fnHoldMilliseconds)ms")
+    }
+
+    private func isStable(since: UInt64?, now: UInt64) -> Bool {
+        guard let since, now >= since else { return false }
+        return now - since >= sustainStableNanoseconds
+    }
+
+    private func scheduleRestoreIfIdle(reason: String) {
+        guard duckedByUs, !fnGate.held, !sustainActive, restoreWork == nil else { return }
+        let generation = fnGate.generation
+        let work = DispatchWorkItem { [weak self] in
+            self?.restoreIfStillIdle(generation: generation, reason: reason)
+        }
+        restoreWork = work
+        log("restore scheduled reason=\(reason) generation=\(generation) delayMs=\(Int(restoreDelay * 1000))")
+        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay, execute: work)
+    }
+
+    private func restoreIfStillIdle(generation: UInt64, reason: String) {
+        restoreWork = nil
+        guard generation == fnGate.generation, !fnGate.held, !sustainActive else {
+            log("restore skipped generation=\(generation) current=\(fnGate.generation) fnHeld=\(fnGate.held) sustain=\(sustainActive)")
+            return
+        }
+        applyDuck(false, reason: reason)
     }
 
     private func applyDuck(_ on: Bool, reason: String) {
         if on {
             if duckedByUs { return }
-            mutedBefore = isSystemMuted()
-            if !mutedBefore {
-                setSystemMuted(true)
+            guard let before = systemMuteState() else {
+                log("DUCK failed (\(reason)): cannot read output mute state")
+                return
             }
+            mutedBefore = before
+            if !mutedBefore && !setSystemMuted(true) { return }
             duckedByUs = true
             writeStatus("ducked \(reason)")
             log("DUCK on (\(reason)) mutedBefore=\(mutedBefore)")
         } else {
             if !duckedByUs { return }
             if !mutedBefore {
-                setSystemMuted(false)
+                guard setSystemMuted(false) else {
+                    log("DUCK restore failed (\(reason)); keeping ownership state")
+                    return
+                }
             }
             duckedByUs = false
             writeStatus("idle")
             log("DUCK off (\(reason)) restoredMuted=\(mutedBefore)")
         }
-        lastNote = reason
+    }
+}
+
+private func combinedFnHeld() -> Bool {
+    CGEventSource.flagsState(.combinedSessionState).contains(.maskSecondaryFn)
+}
+
+private func runSelfTest() {
+    let threshold = UInt64(DuckController.fnHoldMilliseconds) * 1_000_000
+    var gate = FnHoldGate(thresholdNanoseconds: threshold)
+    var failures: [String] = []
+
+    func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
+        if !condition() { failures.append(message) }
+    }
+
+    _ = gate.update(held: true, at: 0)
+    expect(!gate.shouldArm(generation: gate.generation, at: threshold - 1), "armed before hold threshold")
+    expect(gate.shouldArm(generation: gate.generation, at: threshold), "did not arm at hold threshold")
+
+    let firstGeneration = gate.generation
+    _ = gate.update(held: false, at: threshold + 50_000_000)
+    let newDownAt = threshold + 60_000_000
+    _ = gate.update(held: true, at: newDownAt)
+    expect(gate.generation != firstGeneration, "release/re-press did not create a new generation")
+    expect(!gate.shouldArm(generation: firstGeneration, at: threshold * 3), "stale generation could arm after re-press")
+    expect(!gate.shouldArm(generation: gate.generation, at: newDownAt + 200_000_000), "rapid re-press armed too early")
+    expect(gate.shouldArm(generation: gate.generation, at: newDownAt + threshold), "new hold did not arm after its own duration")
+
+    if failures.isEmpty {
+        print("self-test passed holdThresholdMs=\(DuckController.fnHoldMilliseconds)")
+    } else {
+        for failure in failures { print("self-test failed: \(failure)") }
+        exit(1)
     }
 }
 
 private func dumpDebug() {
-    print("systemMuted=\(isSystemMuted())")
+    if let muted = systemMuteState() {
+        print("systemMuted=\(muted)")
+    } else {
+        print("systemMuted=unknown")
+    }
     print("doubaoHALCapturing=\(doubaoHALCapturing())")
     let overlay = doubaoRecordingOverlayVisible()
     print("doubaoRecordingOverlayVisible=\(overlay.0) \(overlay.1)")
     print("(recording overlay ignores bars parked flush with a screen's right edge)")
     print("currentInputSourceIsDoubao=\(currentInputSourceIsDoubao())")
-    print("fnHeld=\(fnHeld())")
+    print("fnHeld=\(hardwareFnHeld()) hidSystemState")
+    print("fnHeldCombined=\(combinedFnHeld())")
+    print("fnHoldThresholdMs=\(DuckController.fnHoldMilliseconds)")
     print("process objects:")
     for id in processObjectIDs() {
         let bid = audioString(id, kProcessBundleID) ?? "?"
@@ -384,11 +635,11 @@ private func runDaemon() {
     log("started pid=\(ProcessInfo.processInfo.processIdentifier)")
     // A previous instance may have been killed mid-duck and left the system
     // muted. If Doubao shows no recording activity right now, unmute once.
-    if isSystemMuted() {
+    if let muted = systemMuteState(), muted {
         let overlay = doubaoRecordingOverlayVisible().0
         let hal = doubaoHALCapturing()
-        if !overlay && !hal && !fnHeld() {
-            setSystemMuted(false)
+        if !overlay && !hal && !hardwareFnHeld() {
+            _ = setSystemMuted(false)
             log("startup: found system muted with no Doubao activity; unmuted")
         } else {
             log("startup: system muted, but Doubao appears active; leaving as-is")
@@ -410,14 +661,31 @@ private func runDaemon() {
             queue: .main
         ) { note in
             log("notify \(note.name.rawValue) userInfo=\(note.userInfo ?? [:])")
-            duck.tick()
+            duck.pollSustain()
         }
     }
 
-    let timer = Timer(timeInterval: 0.08, repeats: true) { _ in
-        duck.tick()
+    let sustainTimer = Timer(timeInterval: 0.20, repeats: true) { _ in
+        duck.pollSustain()
     }
-    RunLoop.main.add(timer, forMode: .common)
+    RunLoop.main.add(sustainTimer, forMode: .common)
+    let fnMonitor = FnEventMonitor { held in
+        duck.handleFnChanged(held, source: "event-tap")
+    }
+    _ = fnMonitor.start()
+
+    // Globe/Fn often never appears in a session event tap. hidSystemState is
+    // the signal that actually worked for hold-to-talk; keep polling it even
+    // when the tap is created successfully.
+    var lastHidHeld: Bool?
+    let hidTimer = Timer(timeInterval: 0.08, repeats: true) { _ in
+        let held = hardwareFnHeld()
+        if held != lastHidHeld {
+            lastHidHeld = held
+            duck.handleFnChanged(held, source: "hid-state")
+        }
+    }
+    RunLoop.main.add(hidTimer, forMode: .common)
 
     // If launchd kills or restarts us mid-duck, unmute before dying so the
     // system never stays silently muted by a dead daemon.
@@ -430,22 +698,42 @@ private func runDaemon() {
     srcInt.setEventHandler { duck.emergencyRestore("SIGINT") }
     srcInt.resume()
 
-    RunLoop.main.run()
+    withExtendedLifetime(fnMonitor) {
+        withExtendedLifetime(sustainTimer) {
+            withExtendedLifetime(hidTimer) {
+                RunLoop.main.run()
+            }
+        }
+    }
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
-if args.contains("--dump") || args.contains("--status") {
+if args.contains("--self-test") {
+    runSelfTest()
+} else if args.contains("--dump") || args.contains("--status") {
     dumpDebug()
     if let text = try? String(contentsOfFile: statusPath, encoding: .utf8) {
         print("statusFile=\(text.trimmingCharacters(in: .whitespacesAndNewlines))")
     }
 } else if args.contains("--test-mute") {
     print("muting 1s…")
-    let was = isSystemMuted()
-    setSystemMuted(true)
+    guard let was = systemMuteState(), setSystemMuted(true) else {
+        print("mute failed: default output device does not expose a writable mute property")
+        exit(1)
+    }
     Thread.sleep(forTimeInterval: 1.0)
-    if !was { setSystemMuted(false) }
+    if !was && !setSystemMuted(false) {
+        print("restore failed")
+        exit(1)
+    }
     print("restored")
+} else if args.contains("--force-unmute") {
+    if setSystemMuted(false) {
+        print("restored")
+    } else {
+        print("restore failed")
+        exit(1)
+    }
 } else {
     runDaemon()
 }

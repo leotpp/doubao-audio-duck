@@ -14,11 +14,15 @@ for name in "${LABEL}" "${OLD_LABEL}"; do
   fi
 done
 
+# Restore output through the same Core Audio path as the daemon before the
+# executable is removed. The old AppleScript form is not reliable on newer
+# macOS locales and silently hid failures.
+if [[ -x "${BIN}" ]]; then
+  "${BIN}" --force-unmute >/dev/null 2>&1 || true
+fi
+
 rm -f "${PLIST}" "${OLD_PLIST}" "${BIN}"
 rm -f /tmp/doubao-audio-duck.status /tmp/doubao-audio-duck.lock
-
-# If we muted and then crashed, don't leave the Mac silent.
-osascript -e 'set volume without output muted' >/dev/null 2>&1 || true
 
 echo "已停止服务并删除 ${BIN} 与 LaunchAgent。"
 echo "源码目录未删除：$(cd "$(dirname "$0")" && pwd)"
