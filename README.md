@@ -46,13 +46,13 @@ Play anime, music, or video while using Doubao voice input; this helper mutes sy
 
 ## 工作方式 · How it works
 
-程序以 `hidSystemState` 轮询 Fn 硬件状态（Globe/Fn 经常进不了 session event tap），并以单调时钟判断按住时长。浮层和 HAL 不能单独启动静音，但 **Fn 按下后约 1.2 秒内**可以启动或维持：
+程序以 `hidSystemState` 直接轮询 Fn 硬件状态，不创建全局 event tap，并以单调时钟判断按住时长。浮层和 HAL 不能单独启动静音，但 **Fn 按下后约 1.2 秒内**可以启动或维持：
 
 1. **启动（按住）：** 当前输入法是豆包，并且 Fn 按住默认约 300 ms；短暂的 Fn+亮度按键不会触发。可用 `DUCK_FN_HOLD_MS=500 ./install.sh` 调整。
 2. **启动（点击）：** 刚按过 Fn，随后出现未贴边的高层级语音浮层，或 Core Audio 连续约 320 ms 标记豆包正在采集。
 3. **维持：** 上述浮层或 HAL 采集可在松键后继续静音（覆盖双击 Fn 持续录音）。空闲贴边语音条不算录音。
 
-The daemon polls Fn via `hidSystemState` (Globe/Fn often never appears in a session event tap) and uses a monotonic hold duration. Overlay and HAL cannot start a duck alone, but they **can start or sustain one within about 1.2 s of an Fn press**:
+The daemon polls Fn directly via `hidSystemState`, without installing a global event tap, and uses a monotonic hold duration. Overlay and HAL cannot start a duck alone, but they **can start or sustain one within about 1.2 s of an Fn press**:
 
 1. **Start (hold):** Doubao is the current input source and Fn has been held for about 300 ms by default. Brief Fn+brightness taps are ignored. Tune it with `DUCK_FN_HOLD_MS=500 ./install.sh`.
 2. **Start (click):** A recent Fn press is followed by a non-parked recording overlay, or by about 320 ms of stable Core Audio capture.
@@ -79,10 +79,6 @@ xcode-select --install
 ```bash
 xcode-select --install
 ```
-
-如果日志显示 `Fn event tap unavailable`，请在“系统设置 → 隐私与安全性 → 输入监控/辅助功能”中允许已安装的 helper。没有事件监听权限时，程序仍会用 `hidSystemState` 轮询 Fn，按住说话仍然可用。
-
-If the log says `Fn event tap unavailable`, allow the installed helper under System Settings → Privacy & Security → Input Monitoring/Accessibility. Without event-monitoring permission, the helper still polls Fn via `hidSystemState`, so hold-to-talk continues to work.
 
 ## 安装 · Installation
 

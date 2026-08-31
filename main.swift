@@ -271,79 +271,8 @@ private struct FnHoldGate {
     }
 }
 
-private let kVKFunction: Int64 = 0x3F
-
 private func hardwareFnHeld() -> Bool {
     CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
-}
-
-private final class FnEventMonitor {
-    private let onChange: (Bool) -> Void
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private var lastFnHeld = false
-
-    init(onChange: @escaping (Bool) -> Void) {
-        self.onChange = onChange
-    }
-
-    func start() -> Bool {
-        let mask = CGEventMask(
-            (1 << CGEventType.flagsChanged.rawValue)
-            | (1 << CGEventType.keyDown.rawValue)
-            | (1 << CGEventType.keyUp.rawValue)
-        )
-        let callback: CGEventTapCallBack = { _, type, event, userInfo in
-            guard let userInfo else { return Unmanaged.passUnretained(event) }
-            let monitor = Unmanaged<FnEventMonitor>.fromOpaque(userInfo).takeUnretainedValue()
-
-            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                if let tap = monitor.eventTap {
-                    CGEvent.tapEnable(tap: tap, enable: true)
-                    log("Fn event tap re-enabled after type=\(type.rawValue)")
-                }
-            } else if type == .flagsChanged || type == .keyDown || type == .keyUp {
-                monitor.handle(event, type: type)
-            }
-            return Unmanaged.passUnretained(event)
-        }
-
-        let userInfo = Unmanaged.passUnretained(self).toOpaque()
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .listenOnly,
-            eventsOfInterest: mask,
-            callback: callback,
-            userInfo: userInfo
-        ) else {
-            log("Fn event tap unavailable; hid-state polling remains the source of truth")
-            return false
-        }
-
-        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
-            log("Fn event tap run-loop source unavailable")
-            return false
-        }
-        eventTap = tap
-        runLoopSource = source
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-        log("Fn event tap started")
-        return true
-    }
-
-    private func handle(_ event: CGEvent, type: CGEventType) {
-        var held = event.flags.contains(.maskSecondaryFn)
-        let keycode = event.getIntegerValueField(.keyboardEventKeycode)
-        if keycode == kVKFunction {
-            if type == .keyDown { held = true }
-            if type == .keyUp { held = false }
-        }
-        guard held != lastFnHeld else { return }
-        lastFnHeld = held
-        onChange(held)
-    }
 }
 
 private final class DuckController {
@@ -669,14 +598,10 @@ private func runDaemon() {
         duck.pollSustain()
     }
     RunLoop.main.add(sustainTimer, forMode: .common)
-    let fnMonitor = FnEventMonitor { held in
-        duck.handleFnChanged(held, source: "event-tap")
-    }
-    _ = fnMonitor.start()
 
-    // Globe/Fn often never appears in a session event tap. hidSystemState is
-    // the signal that actually worked for hold-to-talk; keep polling it even
-    // when the tap is created successfully.
+    // Poll hidSystemState directly. Avoid a global event tap: if an event-tap
+    // client stalls, WindowServer can spend substantial time dispatching input
+    // events and make typing plus system animations lag globally.
     var lastHidHeld: Bool?
     let hidTimer = Timer(timeInterval: 0.08, repeats: true) { _ in
         let held = hardwareFnHeld()
@@ -698,11 +623,9 @@ private func runDaemon() {
     srcInt.setEventHandler { duck.emergencyRestore("SIGINT") }
     srcInt.resume()
 
-    withExtendedLifetime(fnMonitor) {
-        withExtendedLifetime(sustainTimer) {
-            withExtendedLifetime(hidTimer) {
-                RunLoop.main.run()
-            }
+    withExtendedLifetime(sustainTimer) {
+        withExtendedLifetime(hidTimer) {
+            RunLoop.main.run()
         }
     }
 }
