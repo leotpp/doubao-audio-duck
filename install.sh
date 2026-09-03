@@ -43,11 +43,6 @@ cat > "${PLIST}" <<EOF
     <array>
         <string>${BIN}</string>
     </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>DUCK_FN_HOLD_MS</key>
-        <string>${DUCK_FN_HOLD_MS:-300}</string>
-    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

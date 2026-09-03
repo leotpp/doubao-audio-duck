@@ -241,15 +241,9 @@ private struct FnHoldGate {
         case released(generation: UInt64, durationNanoseconds: UInt64)
     }
 
-    let thresholdNanoseconds: UInt64
     private(set) var held = false
     private(set) var generation: UInt64 = 0
     private var pressedAt: UInt64?
-
-    init(thresholdNanoseconds: UInt64) {
-        self.thresholdNanoseconds = thresholdNanoseconds
-        self.pressedAt = nil
-    }
 
     mutating func update(held: Bool, at now: UInt64) -> Event? {
         guard held != self.held else { return nil }
@@ -264,10 +258,31 @@ private struct FnHoldGate {
         pressedAt = nil
         return .released(generation: generation, durationNanoseconds: duration)
     }
+}
 
-    func shouldArm(generation: UInt64, at now: UInt64) -> Bool {
-        guard held, self.generation == generation, let pressedAt else { return false }
-        return now >= pressedAt && now - pressedAt >= thresholdNanoseconds
+/// Fn is only corroboration, not proof of voice recording: macOS also sets the
+/// Fn flag for shortcuts such as Fn-Up/Fn-Down in terminals and candidate UIs.
+private struct FnCorroborationGate {
+    let windowNanoseconds: UInt64
+    private(set) var deadline: UInt64 = 0
+
+    mutating func noteFnActivity(at now: UInt64) {
+        deadline = now &+ windowNanoseconds
+    }
+
+    func isRecent(fnHeld: Bool, at now: UInt64) -> Bool {
+        fnHeld || now < deadline
+    }
+
+    func allowsDuckStart(
+        fnHeld: Bool,
+        at now: UInt64,
+        inputSourceIsDoubao: Bool,
+        recordingEvidenceIsStable: Bool
+    ) -> Bool {
+        isRecent(fnHeld: fnHeld, at: now)
+            && inputSourceIsDoubao
+            && recordingEvidenceIsStable
     }
 }
 
@@ -276,22 +291,9 @@ private func hardwareFnHeld() -> Bool {
 }
 
 private final class DuckController {
-    /// The hold threshold is measured from the actual Fn-down event, not from
-    /// how many times a timer or notification happened to call into the state
-    /// machine. Override with DUCK_FN_HOLD_MS for hardware-specific tuning.
-    static let fnHoldMilliseconds: Int = {
-        if let s = ProcessInfo.processInfo.environment["DUCK_FN_HOLD_MS"],
-           let n = Int(s), (100...2_000).contains(n) {
-            return n
-        }
-        return 300
-    }()
-
-    private static let fnHoldNanoseconds = UInt64(fnHoldMilliseconds) * 1_000_000
     private var duckedByUs = false
     private var mutedBefore = false
-    private var fnGate = FnHoldGate(thresholdNanoseconds: DuckController.fnHoldNanoseconds)
-    private var holdWork: DispatchWorkItem?
+    private var fnGate = FnHoldGate()
     private var restoreWork: DispatchWorkItem?
     private let restoreDelay: TimeInterval = 1.0
     private let sustainStableNanoseconds: UInt64 = 320_000_000
@@ -299,15 +301,16 @@ private final class DuckController {
     private var halStartedAt: UInt64?
     private var overlayInfo = ""
     private var sustainActive = false
-    /// Short Fn taps never cross the hold threshold. Keep a window so the
-    /// recording overlay / HAL capture that follows a click can start the duck.
-    private var fnCorroborationDeadline: UInt64 = 0
+    /// Keep a window so recording evidence that follows a short Fn click can
+    /// start the duck, while unrelated Fn shortcuts remain insufficient.
     private static let fnCorroborationNanoseconds: UInt64 = 1_200_000_000
+    private var fnCorroboration = FnCorroborationGate(
+        windowNanoseconds: DuckController.fnCorroborationNanoseconds
+    )
 
     /// Last-resort restore used on SIGTERM/SIGINT so a killed daemon
     /// never leaves the system muted. Runs before exit.
     func emergencyRestore(_ why: String) {
-        holdWork?.cancel()
         restoreWork?.cancel()
         if duckedByUs && !mutedBefore {
             _ = setSystemMuted(false)
@@ -321,30 +324,17 @@ private final class DuckController {
         let now = monotonicNanoseconds()
         guard let event = fnGate.update(held: held, at: now) else { return }
 
-        holdWork?.cancel()
-        holdWork = nil
+        fnCorroboration.noteFnActivity(at: now)
 
         switch event {
         case .pressed(let generation):
-            // A re-press cancels a pending restore immediately, rather than
-            // waiting for the new hold to cross the 300ms start threshold.
+            // A re-press cancels a pending restore immediately. It must still
+            // be corroborated by a stable Doubao recording signal before mute.
             restoreWork?.cancel()
             restoreWork = nil
-            fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
             log("Fn down source=\(source) generation=\(generation)")
 
-            guard !duckedByUs else { return }
-            let work = DispatchWorkItem { [weak self] in
-                self?.armFn(generation: generation)
-            }
-            holdWork = work
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + .milliseconds(DuckController.fnHoldMilliseconds),
-                execute: work
-            )
-
         case .released(let generation, let durationNanoseconds):
-            fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
             log("Fn up source=\(source) generation=\(generation) durationMs=\(durationMilliseconds(durationNanoseconds))")
             if duckedByUs {
                 scheduleRestoreIfIdle(reason: "fn-up")
@@ -353,11 +343,11 @@ private final class DuckController {
     }
 
     /// Overlay and HAL are corroboration/sustain signals. They cannot start a
-    /// duck on their own, but after a recent Fn press they can — that covers
-    /// a click-to-record that never crosses the hold threshold.
+    /// duck on their own, but after a recent Fn press they can start it —
+    /// including click-to-record and double-tap continuous recording.
     func pollSustain() {
         let now = monotonicNanoseconds()
-        let fnRecent = fnGate.held || now < fnCorroborationDeadline
+        let fnRecent = fnCorroboration.isRecent(fnHeld: fnGate.held, at: now)
         guard duckedByUs || fnRecent else { return }
 
         let (overlayNow, info) = doubaoRecordingOverlayVisible()
@@ -389,7 +379,12 @@ private final class DuckController {
         }
 
         if !duckedByUs {
-            guard newSustainActive, currentInputSourceIsDoubao() else { return }
+            guard fnCorroboration.allowsDuckStart(
+                fnHeld: fnGate.held,
+                at: now,
+                inputSourceIsDoubao: currentInputSourceIsDoubao(),
+                recordingEvidenceIsStable: newSustainActive
+            ) else { return }
             let reason = overlayStable ? "overlay[\(overlayInfo)]" : "hal"
             applyDuck(true, reason: reason)
             return
@@ -401,27 +396,6 @@ private final class DuckController {
         } else {
             scheduleRestoreIfIdle(reason: "idle")
         }
-    }
-
-    private func armFn(generation: UInt64) {
-        holdWork = nil
-        let now = monotonicNanoseconds()
-        guard fnGate.shouldArm(generation: generation, at: now) else { return }
-
-        guard currentInputSourceIsDoubao() else {
-            log("Fn hold ignored generation=\(generation): current input source is not Doubao")
-            // The input source can change while Fn is held. Retry without
-            // counting callbacks as elapsed time, but never after release.
-            guard fnGate.held else { return }
-            let work = DispatchWorkItem { [weak self] in
-                self?.armFn(generation: generation)
-            }
-            holdWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100), execute: work)
-            return
-        }
-
-        applyDuck(true, reason: "fn-\(DuckController.fnHoldMilliseconds)ms")
     }
 
     private func isStable(since: UInt64?, now: UInt64) -> Bool {
@@ -481,8 +455,8 @@ private func combinedFnHeld() -> Bool {
 }
 
 private func runSelfTest() {
-    let threshold = UInt64(DuckController.fnHoldMilliseconds) * 1_000_000
-    var gate = FnHoldGate(thresholdNanoseconds: threshold)
+    var gate = FnHoldGate()
+    var corroboration = FnCorroborationGate(windowNanoseconds: 1_200_000_000)
     var failures: [String] = []
 
     func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
@@ -490,20 +464,29 @@ private func runSelfTest() {
     }
 
     _ = gate.update(held: true, at: 0)
-    expect(!gate.shouldArm(generation: gate.generation, at: threshold - 1), "armed before hold threshold")
-    expect(gate.shouldArm(generation: gate.generation, at: threshold), "did not arm at hold threshold")
-
+    expect(gate.held, "Fn press was not recorded")
     let firstGeneration = gate.generation
-    _ = gate.update(held: false, at: threshold + 50_000_000)
-    let newDownAt = threshold + 60_000_000
-    _ = gate.update(held: true, at: newDownAt)
+    _ = gate.update(held: false, at: 50_000_000)
+    expect(!gate.held, "Fn release was not recorded")
+    _ = gate.update(held: true, at: 60_000_000)
     expect(gate.generation != firstGeneration, "release/re-press did not create a new generation")
-    expect(!gate.shouldArm(generation: firstGeneration, at: threshold * 3), "stale generation could arm after re-press")
-    expect(!gate.shouldArm(generation: gate.generation, at: newDownAt + 200_000_000), "rapid re-press armed too early")
-    expect(gate.shouldArm(generation: gate.generation, at: newDownAt + threshold), "new hold did not arm after its own duration")
+
+    corroboration.noteFnActivity(at: 0)
+    expect(!corroboration.allowsDuckStart(
+        fnHeld: true, at: 400_000_000, inputSourceIsDoubao: true, recordingEvidenceIsStable: false
+    ), "Fn-only shortcut could start ducking")
+    expect(corroboration.allowsDuckStart(
+        fnHeld: true, at: 400_000_000, inputSourceIsDoubao: true, recordingEvidenceIsStable: true
+    ), "Fn plus stable recording evidence could not start ducking")
+    expect(!corroboration.allowsDuckStart(
+        fnHeld: false, at: 1_200_000_000, inputSourceIsDoubao: true, recordingEvidenceIsStable: true
+    ), "expired Fn corroboration could start ducking")
+    expect(!corroboration.allowsDuckStart(
+        fnHeld: false, at: 400_000_000, inputSourceIsDoubao: false, recordingEvidenceIsStable: true
+    ), "non-Doubao input source could start ducking")
 
     if failures.isEmpty {
-        print("self-test passed holdThresholdMs=\(DuckController.fnHoldMilliseconds)")
+        print("self-test passed")
     } else {
         for failure in failures { print("self-test failed: \(failure)") }
         exit(1)
@@ -523,7 +506,7 @@ private func dumpDebug() {
     print("currentInputSourceIsDoubao=\(currentInputSourceIsDoubao())")
     print("fnHeld=\(hardwareFnHeld()) hidSystemState")
     print("fnHeldCombined=\(combinedFnHeld())")
-    print("fnHoldThresholdMs=\(DuckController.fnHoldMilliseconds)")
+    print("fnCorroborationWindowMs=1200")
     print("process objects:")
     for id in processObjectIDs() {
         let bid = audioString(id, kProcessBundleID) ?? "?"

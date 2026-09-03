@@ -46,17 +46,9 @@ Play anime, music, or video while using Doubao voice input; this helper mutes sy
 
 ## 工作方式 · How it works
 
-程序以 `hidSystemState` 直接轮询 Fn 硬件状态，不创建全局 event tap，并以单调时钟判断按住时长。浮层和 HAL 不能单独启动静音，但 **Fn 按下后约 1.2 秒内**可以启动或维持：
+程序以 `hidSystemState` 直接轮询 Fn 硬件状态，不创建全局 event tap。**Fn 只是语音快捷键的旁证，不能单独触发静音**，因为 Terminal 和候选词界面的 Fn+方向键等普通快捷键也会设置 Fn 标志。只有当前输入法为豆包、Fn 正在按住或刚按过约 1.2 秒内，并且出现未贴边的高层级语音浮层或稳定约 320 ms 的 Core Audio 采集时，才会开始静音。浮层或 HAL 采集可在松键后继续维持静音（覆盖双击 Fn 持续录音）；空闲贴边语音条不算录音。
 
-1. **启动（按住）：** 当前输入法是豆包，并且 Fn 按住默认约 300 ms；短暂的 Fn+亮度按键不会触发。可用 `DUCK_FN_HOLD_MS=500 ./install.sh` 调整。
-2. **启动（点击）：** 刚按过 Fn，随后出现未贴边的高层级语音浮层，或 Core Audio 连续约 320 ms 标记豆包正在采集。
-3. **维持：** 上述浮层或 HAL 采集可在松键后继续静音（覆盖双击 Fn 持续录音）。空闲贴边语音条不算录音。
-
-The daemon polls Fn directly via `hidSystemState`, without installing a global event tap, and uses a monotonic hold duration. Overlay and HAL cannot start a duck alone, but they **can start or sustain one within about 1.2 s of an Fn press**:
-
-1. **Start (hold):** Doubao is the current input source and Fn has been held for about 300 ms by default. Brief Fn+brightness taps are ignored. Tune it with `DUCK_FN_HOLD_MS=500 ./install.sh`.
-2. **Start (click):** A recent Fn press is followed by a non-parked recording overlay, or by about 320 ms of stable Core Audio capture.
-3. **Sustain:** That overlay or HAL capture can keep the duck after release (covers double-tap continuous recording). The idle bar parked flush with a screen's right edge is ignored.
+The daemon polls Fn directly via `hidSystemState`, without installing a global event tap. **Fn is corroboration for the voice shortcut, never sufficient to mute by itself**, because ordinary shortcuts such as Fn-arrow keys in terminals and candidate UIs also set the Fn flag. Ducking starts only when Doubao is the current input source, Fn is held or was pressed within about 1.2 seconds, and either a non-parked high-layer recording overlay or about 320 ms of stable Core Audio capture is present. That overlay or HAL capture can sustain ducking after release (covers double-tap continuous recording); the idle bar parked flush with a screen edge is ignored.
 
 闪避使用的是系统输出静音，不是暂停媒体。因此视频或网页会继续播放，只是暂时没有声音。
 
@@ -164,9 +156,9 @@ Run the state-machine regression self-test (does not change system volume):
 ~/.local/bin/doubao-audio-duck --self-test
 ```
 
-录音期间状态文件通常会显示 `ducked fn-300ms`，或短按后的 `ducked overlay[…]` / `ducked hal`；空闲时为 `idle`。没有最近 Fn 按下时，空闲贴边条或单独的 HAL 闪烁不应静音。
+录音期间状态文件通常会显示 `ducked overlay[…]` 或 `ducked hal`；空闲时为 `idle`。单独按住 Fn（包括 Fn+方向键）不会静音；没有最近 Fn 按下时，空闲贴边条或单独的 HAL 闪烁也不应静音。
 
-During recording, the status file normally contains `ducked fn-300ms`, or `ducked overlay[…]` / `ducked hal` after a short Fn click. It is `idle` when inactive. Without a recent Fn press, the parked idle bar or a lone HAL flicker should not mute.
+During recording, the status file normally contains `ducked overlay[…]` or `ducked hal`; it is `idle` when inactive. Fn alone (including Fn-arrow shortcuts) cannot mute; without a recent Fn press, a parked idle bar or a lone HAL flicker cannot mute either.
 
 ## 安装后文件 · Installed files
 
