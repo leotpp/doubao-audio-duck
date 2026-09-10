@@ -30,14 +30,18 @@ Play anime, music, or video while using Doubao voice input; this helper mutes sy
 
 ## 功能亮点 · Features
 
+- **按下 Fn 后约 50–60 ms 内静音**。旧版要等 300 ms 才静音，而豆包在 Fn 按下瞬间就开麦，那 300 ms 的番剧对白会被一起识别进去。
 - **只有先按 Fn 才会开始静音**；空闲时贴在屏幕右缘的语音条、以及豆包自己闪动的采麦标志，都不会单独静音。
+- Fn+方向键、Fn+Delete、Fn+亮度等组合键不会误伤：静音后若判定为组合键会立刻撤销（约 100 ms）。
 - Fn 启动后，未贴边的语音浮层或稳定的 Core Audio 采集可维持静音（覆盖双击 Fn 持续录音）。
 - 使用 macOS 系统级输出静音，因此 Safari、Chrome、视频播放器和其他应用都会暂时静音。
 - 结束录音后约 1 秒恢复，避免松键或浮层抖动时把 AirPlay 掐断又接上。
 - 如果开始录音前系统已经静音，结束时不会擅自取消静音。
 - 以 Swift 单文件实现，安装脚本会在当前 Mac 上重新编译，兼容 Apple Silicon 与 Intel 的本机编译流程。
 
+- **Mutes about 50–60 ms after Fn goes down.** The previous build waited 300 ms, and because Doubao opens the microphone on Fn-down, that window is long enough to recognise the playback.
 - **Mute starts only after Fn is pressed**; an idle bar parked against a screen's right edge, and Doubao's flickering capture flag, cannot start a duck on their own.
+- Fn+arrow, Fn+Delete and Fn+brightness chords are not mistaken for dictation: a chord detected just after muting undoes the mute (~100 ms).
 - After a recent Fn press, a non-parked recording overlay or stable Core Audio capture can start or keep the duck (covers a click as well as hold / double-tap continuous recording).
 - Because it uses system-level output mute, Safari, Chrome, media players, and other apps are muted together.
 - Restores audio about 1 second after recording ends to avoid chopping AirPlay streams.
@@ -46,9 +50,27 @@ Play anime, music, or video while using Doubao voice input; this helper mutes sy
 
 ## 工作方式 · How it works
 
-程序以 `hidSystemState` 直接轮询 Fn 硬件状态，不创建全局 event tap。**Fn 只是语音快捷键的旁证，不能单独触发静音**，因为 Terminal 和候选词界面的 Fn+方向键等普通快捷键也会设置 Fn 标志。只有当前输入法为豆包、Fn 正在按住或刚按过约 1.2 秒内，并且出现未贴边的高层级语音浮层或稳定约 320 ms 的 Core Audio 采集时，才会开始静音。浮层或 HAL 采集可在松键后继续维持静音（覆盖双击 Fn 持续录音）；空闲贴边语音条不算录音。
+程序用一条**专用线程**以 `usleep` 轮询 `hidSystemState`（活跃时 2 ms、空闲 5 ms），不创建全局 event tap。**刻意不用定时器**：在 launchd 后台任务里实测，20 ms 的 `DispatchSourceTimer` 中位间隔只有 68 ms、主 runloop 定时器 62 ms——系统会合并后台进程的定时器，而 `usleep` 不会（中位 7.8 ms）。
 
-The daemon polls Fn directly via `hidSystemState`, without installing a global event tap. **Fn is corroboration for the voice shortcut, never sufficient to mute by itself**, because ordinary shortcuts such as Fn-arrow keys in terminals and candidate UIs also set the Fn flag. Ducking starts only when Doubao is the current input source, Fn is held or was pressed within about 1.2 seconds, and either a non-parked high-layer recording overlay or about 320 ms of stable Core Audio capture is present. That overlay or HAL capture can sustain ducking after release (covers double-tap continuous recording); the idle bar parked flush with a screen edge is ignored.
+浮层和 HAL 不能单独启动静音，但 **Fn 按下后约 1.2 秒内**可以启动或维持：
+
+1. **启动（按下）：** 当前输入法是豆包，且 Fn 已确认按住默认 40 ms（`DUCK_FN_CONFIRM_MS`，可调 0–400）。这两帧确认用来滤掉 `hidSystemState` 的单次假信号。
+2. **纠错（组合键）：** 静音后 120 ms 内查一次 Fn 的常见搭档键（方向键、Delete、F1–F12、亮度、音量、媒体键）。若发现是组合键，立刻撤销静音，并在本次按住期间不再静音。
+3. **纠错（短按）：** 若 Fn 按住不足 400 ms 就松开、且全程没有出现采麦证据，判定为误触，150 ms 内恢复（而不是等 1 秒）。
+4. **启动（点击）／维持：** 刚按过 Fn 后，未贴边的高层级语音浮层，或 Core Audio 连续约 320 ms 标记豆包正在采集，可以启动或维持静音（覆盖双击 Fn 持续录音）。空闲贴边语音条不算录音。
+
+输入法查询（`TISCopyCurrentKeyboardInputSource`）首次调用要建立 XPC 连接，冷启动实测约 33 ms，因此放在**按下瞬间**执行——这段耗时正好落在确认窗口里，不会加在静音前面；进程启动时也会预热一次。旧版的保守行为（等按住再静音）仍可用 `DUCK_FN_HOLD_MS=300 ./install.sh` 启用。
+
+The daemon polls Fn on a **dedicated thread** with `usleep` (2 ms while hot, 5 ms idle), without installing a global event tap. **Deliberately not a timer:** measured inside a launchd background job, a 20 ms `DispatchSourceTimer` fired at a 68 ms median and a main-runloop timer at 62 ms, because the system coalesces timers for background processes. `usleep` is not coalesced (7.8 ms median).
+
+Overlay and HAL cannot start a duck alone, but they **can start or sustain one within about 1.2 s of an Fn press**:
+
+1. **Start (hold):** Doubao is the current input source and Fn has been confirmed down for 40 ms by default (`DUCK_FN_CONFIRM_MS`, tunable 0–400). The two-tick confirmation rejects a one-off `hidSystemState` phantom report.
+2. **Undo (chord):** for 120 ms after muting, the daemon checks Fn's usual partners (arrows, Delete, F1–F12, brightness, volume, media keys). A chord means the press was not dictation, so the mute is undone and suppressed until Fn is released.
+3. **Undo (short tap):** a hold shorter than 400 ms that never produced capture evidence is treated as a misfire and restored in 150 ms instead of the full second.
+4. **Start (click) / sustain:** A recent Fn press followed by a non-parked recording overlay, or by about 320 ms of stable Core Audio capture, starts or keeps the duck (covers double-tap continuous recording). The idle bar parked flush with a screen's right edge is ignored.
+
+The IME query (`TISCopyCurrentKeyboardInputSource`) builds an XPC connection on first use and costs ~33 ms cold, so it runs **at press time** — that cost lands inside the confirmation window instead of in front of the mute — and the connection is warmed at startup. The old conservative behaviour is still available via `DUCK_FN_HOLD_MS=300 ./install.sh`.
 
 闪避使用的是系统输出静音，不是暂停媒体。因此视频或网页会继续播放，只是暂时没有声音。
 
@@ -156,9 +178,9 @@ Run the state-machine regression self-test (does not change system volume):
 ~/.local/bin/doubao-audio-duck --self-test
 ```
 
-录音期间状态文件通常会显示 `ducked overlay[…]` 或 `ducked hal`；空闲时为 `idle`。单独按住 Fn（包括 Fn+方向键）不会静音；没有最近 Fn 按下时，空闲贴边条或单独的 HAL 闪烁也不应静音。
+录音期间状态文件通常显示 `ducked fn-4Xms`（例如 `ducked fn-48ms`，即从检测到 Fn 按下到静音的毫秒数），或短按后的 `ducked overlay[…]` / `ducked hal`；空闲时为 `idle`。没有最近 Fn 按下时，空闲贴边条或单独的 HAL 闪烁不应静音。
 
-During recording, the status file normally contains `ducked overlay[…]` or `ducked hal`; it is `idle` when inactive. Fn alone (including Fn-arrow shortcuts) cannot mute; without a recent Fn press, a parked idle bar or a lone HAL flicker cannot mute either.
+During recording, the status file normally contains `ducked fn-4Xms` — for example `ducked fn-48ms`, the milliseconds from Fn-down detection to the mute — or `ducked overlay[…]` / `ducked hal` after a short Fn click. It is `idle` when inactive. Without a recent Fn press, the parked idle bar or a lone HAL flicker should not mute.
 
 ## 安装后文件 · Installed files
 

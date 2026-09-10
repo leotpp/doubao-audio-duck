@@ -32,6 +32,27 @@ swiftc -O -o "${BIN}" "${ROOT}/main.swift" \
 
 chmod +x "${BIN}"
 
+# Only forward the tuning knobs the caller actually set. Hard-coding
+# DUCK_FN_HOLD_MS here used to silently pin the daemon to the legacy
+# wait-then-mute path, which is the behaviour that leaks playback into Doubao.
+ENV_BLOCK=""
+if [[ -n "${DUCK_FN_HOLD_MS:-}" || -n "${DUCK_FN_CONFIRM_MS:-}" ]]; then
+  ENV_BLOCK="    <key>EnvironmentVariables</key>
+    <dict>"
+  if [[ -n "${DUCK_FN_HOLD_MS:-}" ]]; then
+    ENV_BLOCK="${ENV_BLOCK}
+        <key>DUCK_FN_HOLD_MS</key>
+        <string>${DUCK_FN_HOLD_MS}</string>"
+  fi
+  if [[ -n "${DUCK_FN_CONFIRM_MS:-}" ]]; then
+    ENV_BLOCK="${ENV_BLOCK}
+        <key>DUCK_FN_CONFIRM_MS</key>
+        <string>${DUCK_FN_CONFIRM_MS}</string>"
+  fi
+  ENV_BLOCK="${ENV_BLOCK}
+    </dict>"
+fi
+
 cat > "${PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -43,6 +64,7 @@ cat > "${PLIST}" <<EOF
     <array>
         <string>${BIN}</string>
     </array>
+${ENV_BLOCK}
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -69,6 +91,7 @@ if launchctl print "gui/${UID_NUM}/${LABEL}" 2>/dev/null | grep -q 'state = runn
   echo "可执行文件：${BIN}"
   echo "开机启动：${PLIST}"
   echo "日志：${LOG_DIR}/doubao-audio-duck.log"
+  echo "运行模式：${BIN} --dump | grep duckMode"
   echo
   echo "自检：${BIN} --dump"
 else
