@@ -1,254 +1,71 @@
 # 豆包输入法语音闪避 · Doubao Audio Duck
 
-> **豆包语音输入时，番剧对白、音乐、说唱也被麦克风一起听进去了？**
->
-> **When using Doubao voice input on Mac, does anime dialogue, music, or rap get picked up by the microphone too?**
+豆包输入法采集麦克风时，自动静音 macOS 默认输出设备；采集结束约 1 秒后恢复原来的静音状态。用于减少喜马拉雅、网页视频或音乐被麦克风一起识别的问题。不会暂停播放或改变播放进度。
 
-豆包输入法的语音识别很快，但在 macOS 上语音输入时不会自动闪避系统声音。你一边播放番剧、音乐、播客或视频，一边按住 Fn 说话，扬声器里的声音可能会被麦克风重新拾取，干扰识别结果。
+Mutes the macOS default output while Doubao Input Method captures the microphone, then restores the previous mute state about one second after capture stops. Playback continues.
 
-Doubao Input Method is fast, but it does not automatically duck system audio during voice typing on macOS. If you play anime, music, podcasts, or videos while holding Fn to speak, the microphone may capture that playback and interfere with recognition.
+非官方个人工具，与字节跳动及豆包团队无关。
 
-**Doubao Audio Duck** 解决的就是这个问题：在**按住 Fn 拉起豆包语音**时自动静音整个 macOS 系统输出；松开按键、识别结束后，再恢复声音。它不会暂停视频，也不会改变播放进度。空闲时贴在屏幕右缘的语音条、以及豆包自己闪动的采麦标志，都不会静音。
+## 工作方式
 
-**Doubao Audio Duck** addresses this gap: while you **hold Fn to start Doubao voice input**, it automatically mutes macOS system output and restores audio after recording ends. It does not pause videos or change playback position. An idle voice bar parked against a screen's right edge, and Doubao's own flickering capture flag, will not mute audio.
+- 只检查 bundle ID 为 `com.bytedance.inputmethod.doubaoime` 的 Core Audio 采集状态，不把其他应用开麦当作触发条件。
+- 专用线程每隔约 20ms 发起一次检查，同一时间最多一个扫描；首次观察到采集就执行静音，不再等待 320ms。
+- 不再以 Fn 标志、当前输入法或窗口位置作为静音前提。方向键也可能设置 Function 标志，它不是物理 Fn 专属。
+- 持续采集时保持静音，停止约 1 秒后恢复；恢复前再次采集会取消恢复任务。
+- 保留用户原先的静音状态，正常停止服务时恢复由本进程修改的状态。
 
-这是一个针对真实使用痛点制作的个人工具，当前实现主要基于我的 Mac 和豆包版本验证，不保证适配所有 macOS、豆包版本和硬件组合。如果你也遇到同样的干扰，欢迎试用、反馈和改进。
+**限制：** Core Audio 只能说明豆包正在采集，不能区分后台预采集和实际语音识别。因此豆包后台采麦也会静音。这版优先避免漏静音。它没有修改豆包软件或挂钩其 Fn 处理函数，不能保证在开麦前静音，也不能保证零延迟；20ms 是检查间隔而不是实测端到端延迟。
 
-This is a small personal tool built around a real-world annoyance. The current implementation has mainly been tested with the author's Mac and Doubao version, so compatibility with every macOS release, Doubao version, and hardware setup is not guaranteed. If you have the same problem, try it, report issues, and help improve it.
+The trigger is Doubao's own Core Audio capture state, not a keyboard flag or window heuristic. Capture is checked at roughly 20ms intervals with at most one scan in flight. There is no 320ms start debounce. Only restoration is delayed. Background capture by Doubao also triggers mute; polling cannot guarantee zero latency or mute before the microphone opens.
 
-> 本项目与字节跳动、豆包输入法或其开发团队无关。
->
-> This project is not affiliated with ByteDance or the Doubao Input Method team.
+## 环境与安装
 
-**搜索关键词 / Search terms:** 豆包输入法、Mac 语音输入、macOS 语音识别、麦克风干扰、系统声音静音、录音时静音、音频闪避、番剧、音乐、说唱、视频播放；Doubao Input Method, macOS voice typing, dictation, microphone interference, mute system audio while recording, audio ducking, anime, music, rap, video playback.
-
-## 一句话了解 · In one sentence
-
-播放番剧、音乐或视频时，用豆包输入法按住 Fn 说话；本工具会在录音期间静音系统声音，避免播放内容被麦克风拾取。
-
-Play anime, music, or video while using Doubao voice input; this helper mutes system output during recording so playback is not picked up by the microphone.
-
-## 功能亮点 · Features
-
-- **按下 Fn 后约 50–60 ms 内静音**。旧版要等 300 ms 才静音，而豆包在 Fn 按下瞬间就开麦，那 300 ms 的番剧对白会被一起识别进去。
-- **只有先按 Fn 才会开始静音**；空闲时贴在屏幕右缘的语音条、以及豆包自己闪动的采麦标志，都不会单独静音。
-- Fn+方向键、Fn+Delete、Fn+亮度等组合键不会误伤：静音后若判定为组合键会立刻撤销（约 100 ms）。
-- Fn 启动后，未贴边的语音浮层或稳定的 Core Audio 采集可维持静音（覆盖双击 Fn 持续录音）。
-- 使用 macOS 系统级输出静音，因此 Safari、Chrome、视频播放器和其他应用都会暂时静音。
-- 结束录音后约 1 秒恢复，避免松键或浮层抖动时把 AirPlay 掐断又接上。
-- 如果开始录音前系统已经静音，结束时不会擅自取消静音。
-- 以 Swift 单文件实现，安装脚本会在当前 Mac 上重新编译，兼容 Apple Silicon 与 Intel 的本机编译流程。
-
-- **Mutes about 50–60 ms after Fn goes down.** The previous build waited 300 ms, and because Doubao opens the microphone on Fn-down, that window is long enough to recognise the playback.
-- **Mute starts only after Fn is pressed**; an idle bar parked against a screen's right edge, and Doubao's flickering capture flag, cannot start a duck on their own.
-- Fn+arrow, Fn+Delete and Fn+brightness chords are not mistaken for dictation: a chord detected just after muting undoes the mute (~100 ms).
-- After a recent Fn press, a non-parked recording overlay or stable Core Audio capture can start or keep the duck (covers a click as well as hold / double-tap continuous recording).
-- Because it uses system-level output mute, Safari, Chrome, media players, and other apps are muted together.
-- Restores audio about 1 second after recording ends to avoid chopping AirPlay streams.
-- Preserves a mute state that was already enabled before recording.
-- Implemented as a single Swift source file; the installer compiles a native binary on the current Mac for Apple Silicon or Intel.
-
-## 工作方式 · How it works
-
-程序用一条**专用线程**以 `usleep` 轮询 `hidSystemState`（活跃时 2 ms、空闲 5 ms），不创建全局 event tap。**刻意不用定时器**：在 launchd 后台任务里实测，20 ms 的 `DispatchSourceTimer` 中位间隔只有 68 ms、主 runloop 定时器 62 ms——系统会合并后台进程的定时器，而 `usleep` 不会（中位 7.8 ms）。
-
-浮层和 HAL 不能单独启动静音，但 **Fn 按下后约 1.2 秒内**可以启动或维持：
-
-1. **启动（按下）：** 当前输入法是豆包，且 Fn 已确认按住默认 40 ms（`DUCK_FN_CONFIRM_MS`，可调 0–400）。这两帧确认用来滤掉 `hidSystemState` 的单次假信号。
-2. **纠错（组合键）：** 静音后 120 ms 内查一次 Fn 的常见搭档键（方向键、Delete、F1–F12、亮度、音量、媒体键）。若发现是组合键，立刻撤销静音，并在本次按住期间不再静音。
-3. **纠错（短按）：** 若 Fn 按住不足 400 ms 就松开、且全程没有出现采麦证据，判定为误触，150 ms 内恢复（而不是等 1 秒）。
-4. **启动（点击）／维持：** 刚按过 Fn 后，未贴边的高层级语音浮层，或 Core Audio 连续约 320 ms 标记豆包正在采集，可以启动或维持静音（覆盖双击 Fn 持续录音）。空闲贴边语音条不算录音。
-
-输入法查询（`TISCopyCurrentKeyboardInputSource`）首次调用要建立 XPC 连接，冷启动实测约 33 ms，因此放在**按下瞬间**执行——这段耗时正好落在确认窗口里，不会加在静音前面；进程启动时也会预热一次。旧版的保守行为（等按住再静音）仍可用 `DUCK_FN_HOLD_MS=300 ./install.sh` 启用。
-
-The daemon polls Fn on a **dedicated thread** with `usleep` (2 ms while hot, 5 ms idle), without installing a global event tap. **Deliberately not a timer:** measured inside a launchd background job, a 20 ms `DispatchSourceTimer` fired at a 68 ms median and a main-runloop timer at 62 ms, because the system coalesces timers for background processes. `usleep` is not coalesced (7.8 ms median).
-
-Overlay and HAL cannot start a duck alone, but they **can start or sustain one within about 1.2 s of an Fn press**:
-
-1. **Start (hold):** Doubao is the current input source and Fn has been confirmed down for 40 ms by default (`DUCK_FN_CONFIRM_MS`, tunable 0–400). The two-tick confirmation rejects a one-off `hidSystemState` phantom report.
-2. **Undo (chord):** for 120 ms after muting, the daemon checks Fn's usual partners (arrows, Delete, F1–F12, brightness, volume, media keys). A chord means the press was not dictation, so the mute is undone and suppressed until Fn is released.
-3. **Undo (short tap):** a hold shorter than 400 ms that never produced capture evidence is treated as a misfire and restored in 150 ms instead of the full second.
-4. **Start (click) / sustain:** A recent Fn press followed by a non-parked recording overlay, or by about 320 ms of stable Core Audio capture, starts or keeps the duck (covers double-tap continuous recording). The idle bar parked flush with a screen's right edge is ignored.
-
-The IME query (`TISCopyCurrentKeyboardInputSource`) builds an XPC connection on first use and costs ~33 ms cold, so it runs **at press time** — that cost lands inside the confirmation window instead of in front of the mute — and the connection is warmed at startup. The old conservative behaviour is still available via `DUCK_FN_HOLD_MS=300 ./install.sh`.
-
-闪避使用的是系统输出静音，不是暂停媒体。因此视频或网页会继续播放，只是暂时没有声音。
-
-The tool mutes system output rather than pausing media. Videos and web pages keep playing silently and resume with their existing playback position.
-
-## 环境要求 · Requirements
-
-- macOS 12 或更新版本（已在 macOS 15.7 上验证）。
-- 已安装[豆包输入法](https://shurufa.doubao.com/)，并将其设为当前输入法。
-- Apple Command Line Tools，安装脚本需要其中的 `swiftc`：
+- macOS，系统 Core Audio API 可报告进程采集状态。
+- 豆包输入法。
+- Xcode Command Line Tools (`swiftc`)。
+- 默认输出设备必须支持可写的 mute 属性；外接声卡、AirPlay 等设备不保证兼容。
 
 ```bash
-xcode-select --install
-```
-
-- macOS 12 or newer (verified on macOS 15.7).
-- [Doubao Input Method](https://shurufa.doubao.com/) installed and selected as the current input source.
-- Apple Command Line Tools, because the installer uses `swiftc`:
-
-```bash
-xcode-select --install
-```
-
-## 安装 · Installation
-
-推荐直接从 GitHub 克隆到用户目录：
-
-Clone the project into a user-owned directory:
-
-```bash
-mkdir -p ~/.local/share
-git clone https://github.com/leotpp/doubao-audio-duck.git ~/.local/share/doubao-audio-duck
-cd ~/.local/share/doubao-audio-duck
-chmod +x install.sh uninstall.sh
 ./install.sh
 ```
 
-`install.sh` 会：
+安装到 `~/.local/bin/doubao-audio-duck`，创建并启动登录自启服务 `com.doubao.audio-duck`。安装脚本可重复运行。
 
-1. 使用当前机器上的 `swiftc` 编译 `main.swift`。
-2. 将可执行文件安装到 `~/.local/bin/doubao-audio-duck`。
-3. 创建 `~/Library/LaunchAgents/com.doubao.audio-duck.plist`。
-4. 注册并启动 LaunchAgent，使工具在登录后自动运行。
+旧的 `DUCK_FN_HOLD_MS` / `DUCK_FN_CONFIRM_MS` 参数不再控制采麦模式。
 
-`install.sh` will:
-
-1. Compile `main.swift` with the local `swiftc`.
-2. Install the executable at `~/.local/bin/doubao-audio-duck`.
-3. Create `~/Library/LaunchAgents/com.doubao.audio-duck.plist`.
-4. Bootstrap and start a LaunchAgent so the helper runs after login.
-
-脚本可以重复运行；它会先停止旧的同名 LaunchAgent，再重新编译并启动。
-
-The script is safe to run again; it stops the existing service, recompiles the binary, and starts it again.
-
-## 使用与自检 · Usage and diagnostics
-
-安装完成后，打开网页音乐或视频，切换到豆包输入法并按住默认的 Fn 语音快捷键。录音期间系统输出会静音，松开后约 1 秒恢复。
-
-After installation, play a web page or video, select Doubao, and hold its default Fn voice shortcut. System output should mute during recording and return about 1 second after release.
-
-查看检测状态：
-
-Inspect detection state:
+## 检查
 
 ```bash
+# 当前状态，duckMode 应为 doubao-capture
 ~/.local/bin/doubao-audio-duck --dump
-```
 
-典型的空闲输出：
-
-Typical idle output:
-
-```text
-systemMuted=false
-doubaoHALCapturing=false
-doubaoRecordingOverlayVisible=false
-currentInputSourceIsDoubao=true
-fnHeld=false
-```
-
-手动测试系统静音与恢复（会静音约 1 秒）：
-
-Test mute and restore manually (this mutes output for about one second):
-
-```bash
-~/.local/bin/doubao-audio-duck --test-mute
-```
-
-也可以查看服务、状态文件和最近日志：
-
-You can also inspect the service, status file, and recent logs:
-
-```bash
-launchctl print "gui/$(id -u)/com.doubao.audio-duck" | grep 'state ='
-cat /tmp/doubao-audio-duck.status
-tail -30 ~/Library/Logs/doubao-audio-duck.log
-```
-
-运行状态机回归自检（不改变系统音量）：
-
-Run the state-machine regression self-test (does not change system volume):
-
-```bash
+# 控制器回归测试，使用模拟音频后端，不改变系统声音
 ~/.local/bin/doubao-audio-duck --self-test
+
+# 手动静音 1 秒后恢复
+~/.local/bin/doubao-audio-duck --test-mute
+
+# 日志与服务状态
+ tail -30 ~/Library/Logs/doubao-audio-duck.log
+ launchctl print "gui/$(id -u)/com.doubao.audio-duck"
 ```
 
-录音期间状态文件通常显示 `ducked fn-4Xms`（例如 `ducked fn-48ms`，即从检测到 Fn 按下到静音的毫秒数），或短按后的 `ducked overlay[…]` / `ducked hal`；空闲时为 `idle`。没有最近 Fn 按下时，空闲贴边条或单独的 HAL 闪烁不应静音。
+采集期间状态为 `ducked doubao-capture`，空闲为 `idle`。状态文件：`/tmp/doubao-audio-duck.status`。
 
-During recording, the status file normally contains `ducked fn-4Xms` — for example `ducked fn-48ms`, the milliseconds from Fn-down detection to the mute — or `ducked overlay[…]` / `ducked hal` after a short Fn click. It is `idle` when inactive. Without a recent Fn press, the parked idle bar or a lone HAL flicker should not mute.
-
-## 安装后文件 · Installed files
-
-| 用途 / Purpose | 路径 / Path |
-|---|---|
-| 源码 / Source | 你克隆项目的目录 / The directory where you cloned the project |
-| 可执行文件 / Binary | `~/.local/bin/doubao-audio-duck` |
-| 开机启动 / LaunchAgent | `~/Library/LaunchAgents/com.doubao.audio-duck.plist` |
-| 日志 / Log | `~/Library/Logs/doubao-audio-duck.log` |
-| 当前状态 / Status | `/tmp/doubao-audio-duck.status` |
-
-不要把某台 Mac 上编译好的二进制直接复制到另一台 Mac；请复制源码后在目标机器上重新运行 `install.sh`。
-
-Do not copy a binary compiled on one Mac to another Mac. Copy the source and run `install.sh` on the target machine instead.
-
-## 卸载 · Uninstallation
+默认输出设备切换、多输出路由和异常强制终止的恢复不保证正确；若异常终止后仍静音，可手动执行：
 
 ```bash
-~/.local/share/doubao-audio-duck/uninstall.sh
+~/.local/bin/doubao-audio-duck --force-unmute
 ```
 
-卸载脚本会停止 LaunchAgent、删除已安装的二进制和启动配置，并尝试恢复系统声音。源码目录和日志默认保留。
-
-The uninstall script stops the LaunchAgent, removes the installed binary and launch configuration, and attempts to restore system audio. The source directory and logs are kept by default.
-
-如需临时停止但不删除文件：
-
-To stop the service temporarily without removing files:
+## 卸载
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.doubao.audio-duck"
+./uninstall.sh
 ```
 
-修改 `main.swift` 后，重新运行安装脚本即可重新编译并重启：
+## 文件
 
-After modifying `main.swift`, run the installer again to rebuild and restart:
-
-```bash
-~/.local/share/doubao-audio-duck/install.sh
-```
-
-## 限制与隐私 · Limitations and privacy
-
-- 这是针对豆包输入法的非官方辅助工具，不处理微信输入法、Zoom 或其他应用的录音。
-- 如果把豆包快捷键改成非 Fn 按键，本工具不会再自动静音（浮层和 Core Audio 不能单独启动闪避）。
-- 它会静音所有系统输出，而不是只暂停某一个应用；请确认这正是你想要的行为。
-- 进程不读取普通键盘输入内容，只监听 Fn 修饰键状态、当前输入源、窗口几何信息和 Core Audio 进程状态。
-- 如果程序异常退出后声音仍被静音，可先执行 `~/.local/bin/doubao-audio-duck --force-unmute`，再查看日志或运行卸载脚本。
-- 每个 macOS 用户都需要分别运行一次安装脚本。
-
-- This is an unofficial helper for Doubao Input Method. It does not handle WeChat Input Method, Zoom, or other recording applications.
-- If Doubao's shortcut is changed to a non-Fn key, this helper will no longer start ducking (overlay and Core Audio cannot start a duck on their own).
-- It mutes all system output rather than pausing one application, so make sure that behavior fits your workflow.
-- It does not read ordinary keyboard contents. It only listens for Fn modifier changes and inspects the current input source, window geometry, and Core Audio process state.
-- If an abnormal exit leaves audio muted, run `~/.local/bin/doubao-audio-duck --force-unmute`, then inspect the logs or run the uninstall script.
-- Each macOS user must run the installer separately.
-
-## 项目结构 · Project structure
-
-| 文件 / File | 说明 / Description |
-|---|---|
-| `main.swift` | 守护进程、录音检测、系统静音、状态输出与调试命令 / Daemon, recording detection, system mute, status, and diagnostics |
-| `install.sh` | 编译、安装并启动 LaunchAgent / Build, install, and start the LaunchAgent |
-| `uninstall.sh` | 停止并移除已安装组件 / Stop and remove installed components |
-| `README.md` | 中英文使用说明 / Bilingual documentation |
-
-## 许可证 · License
-
-当前仓库尚未附带具体开源许可证。仓库虽然公开，但如果你准备复制、修改或再分发，请先等待作者补充许可证或取得明确授权。
-
-This repository does not currently include a specific open-source license. Although the repository is public, please wait for a license to be added or obtain explicit permission before copying, modifying, or redistributing the code.
+- `main.swift`：采集检测、静音控制、诊断与自检。
+- `install.sh` / `uninstall.sh`：安装及卸载登录服务。
+- `scratch/trace-fn.swift`：只读 Fn/采麦对照诊断，不参与正常运行。

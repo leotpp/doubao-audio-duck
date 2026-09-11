@@ -24,6 +24,8 @@ private let kProcessBundleID: AudioObjectPropertySelector = 0x70626964   // 'pbi
 private let kProcessIsRunningInput: AudioObjectPropertySelector = 0x70697269 // 'piri'
 
 private func log(_ msg: String) {
+    // Self-tests exercise the controller with a fake audio backend.
+    guard !CommandLine.arguments.contains("--self-test") else { return }
     let line = logDateFormatter.string(from: Date()) + "  " + msg + "\n"
     if let data = line.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: logPath) {
@@ -304,21 +306,75 @@ private func hardwareFnHeld() -> Bool {
 }
 
 private final class DuckController {
-    /// Every Fn tick and every duck decision runs here, never on the main
-    /// runloop. The overlay scan enumerates every window on the system and can
-    /// hold the main thread for tens of milliseconds; sharing a runloop with it
-    /// made the Fn->mute path jitter between 40ms and 140ms.
+    /// All capture transitions and restore decisions are serialized here.
     let queue = DispatchQueue(label: "com.doubao.audio-duck.input", qos: .userInteractive)
 
-    /// Window enumeration + the CoreAudio process walk cost ~12ms together.
-    /// They run here so they can never delay a duck decision, and the results
-    /// hop back onto `queue` which owns the state machine.
-    private let scanQueue = DispatchQueue(label: "com.doubao.audio-duck.scan", qos: .utility)
+    /// Core Audio probing runs separately; no window enumeration is needed.
+    private let scanQueue = DispatchQueue(label: "com.doubao.audio-duck.scan", qos: .userInitiated)
     private var scanInFlight = false
 
     private var lastHidHeld: Bool?
+    private let readMute: () -> Bool?
+    private let writeMute: (Bool) -> Bool
+    private let publishStatus: (String) -> Void
 
-    /// Fn edge detection plus fast-mode arming. Called on `queue`.
+    init(readMute: @escaping () -> Bool? = systemMuteState,
+         writeMute: @escaping (Bool) -> Bool = setSystemMuted,
+         publishStatus: @escaping (String) -> Void = writeStatus) {
+        self.readMute = readMute
+        self.writeMute = writeMute
+        self.publishStatus = publishStatus
+    }
+
+    static func captureRegressionTests() -> [String] {
+        var muted = false
+        var writes: [Bool] = []
+        let controller = DuckController(readMute: { muted }, writeMute: {
+            muted = $0; writes.append($0); return true
+        }, publishStatus: { _ in })
+        var failures: [String] = []
+        controller.queue.sync {
+            // Replay capture without an Fn edge. The first sample must mute.
+            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
+            if !muted { failures.append("Doubao capture without Fn did not mute immediately") }
+            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
+            if writes != [true] { failures.append("active capture must mute exactly once") }
+            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            if !muted { failures.append("audio restored before release grace period") }
+            controller.restoreWork?.cancel()
+            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
+            if muted { failures.append("capture stop did not restore audio") }
+            controller.applySustainSample(overlayNow: true, info: "candidate", halNow: false)
+            if muted { failures.append("window alone incorrectly muted audio") }
+            controller.restoreWork?.cancel()
+        }
+        muted = true
+        writes = []
+        controller.queue.sync {
+            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
+            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            controller.restoreWork?.cancel()
+            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
+            if !muted || !writes.isEmpty { failures.append("pre-existing mute was changed") }
+        }
+        muted = false
+        controller.queue.sync {
+            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
+            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            let stale = controller.captureGeneration
+            controller.restoreWork?.cancel()
+            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
+            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            controller.restoreWork?.cancel()
+            controller.restoreIfStillIdle(generation: stale, reason: "self-test-stale")
+            if !muted { failures.append("stale restore unmuted a new recording") }
+            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
+            if muted { failures.append("new recording did not restore") }
+        }
+        return failures
+    }
+
+    /// Legacy Fn path retained for diagnosis; runDaemon no longer calls it.
     /// Returns true while the tool is "hot" (Fn held or audio ducked) so the
     /// caller can poll faster.
     func pollInput() -> Bool {
@@ -362,23 +418,14 @@ private final class DuckController {
         legacyHoldMilliseconds ?? fnConfirmMilliseconds
     }
 
-    static var modeDescription: String {
-        if let hold = legacyHoldMilliseconds { return "legacy-hold-\(hold)ms" }
-        return "fast-confirm-\(fnConfirmMilliseconds)ms"
-    }
+    static var modeDescription: String { "doubao-capture" }
 
     private static let fnArmNanoseconds = UInt64(fnConfirmMilliseconds) * 1_000_000
     /// Gate threshold — only the conservative legacy path still consults it.
     private static let fnHoldNanoseconds = UInt64(fnHoldMilliseconds) * 1_000_000
-    /// After muting, keep watching for an Fn companion key for this long.
-    /// Fn+F1..F12 / Fn+arrows / Fn+Delete are shortcuts, not dictation, so the
-    /// mute is undone the moment one shows up. The probe deliberately runs
-    /// *after* the mute: querying per-key state costs tens of milliseconds, and
-    /// spending that before muting would hand it straight back to Doubao.
-    private static let companionProbeNanoseconds: UInt64 = 120_000_000
     /// A hold shorter than this that never produced HAL capture or the
-    /// recording overlay was a shortcut chord or a phantom Fn flag; restore
-    /// fast instead of waiting the full second.
+    /// recording overlay was a phantom Fn flag; restore fast instead of
+    /// waiting the full second.
     private static let shortHoldNanoseconds: UInt64 = 400_000_000
     private static let fastRestoreDelay: TimeInterval = 0.15
     private static let standardRestoreDelay: TimeInterval = 1.0
@@ -393,6 +440,7 @@ private final class DuckController {
     private var halStartedAt: UInt64?
     private var overlayInfo = ""
     private var sustainActive = false
+    private var captureGeneration: UInt64 = 0
     /// Short Fn taps never cross the arm threshold. Keep a window so the
     /// recording overlay / HAL capture that follows a click can start the duck.
     private var fnCorroborationDeadline: UInt64 = 0
@@ -401,8 +449,6 @@ private final class DuckController {
     private var fnPressedAt: UInt64 = 0
     private var duckStartedByFn = false
     private var sawRecordingEvidence = false
-    private var companionProbeUntil: UInt64 = 0
-    private var suppressedUntilFnRelease = false
     /// Cached result of the IME check. See the note in handleFnChanged.
     private var inputSourceIsDoubao = false
     private var lastInputSourceRefresh: UInt64 = 0
@@ -438,8 +484,6 @@ private final class DuckController {
             fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
             fnPressedAt = now
             sawRecordingEvidence = false
-            suppressedUntilFnRelease = false
-            companionProbeUntil = 0
             // Query the IME here, not at mute time. The first query in a process
             // builds an XPC connection to the text-input subsystem and costs
             // ~33ms (measured); at press time that is hidden inside the confirm
@@ -465,7 +509,6 @@ private final class DuckController {
         case .released(let generation, let durationNanoseconds):
             fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
             fnPressedAt = 0
-            companionProbeUntil = 0
             log("Fn up source=\(source) generation=\(generation) durationMs=\(durationMilliseconds(durationNanoseconds))")
             if duckedByUs {
                 // A short hold that never produced HAL capture or the recording
@@ -481,29 +524,16 @@ private final class DuckController {
         }
     }
 
-    /// Fast-mode Fn handling, called every ~20ms while the daemon is up.
+    /// Fast-mode Fn handling, called every few milliseconds while the daemon is up.
     ///
-    /// The old design waited 300ms before muting so a stray Fn report or an
-    /// Fn+<key> chord could not silence playback. That wait is what let Doubao
-    /// recognise the first ~300ms of music. Instead we mute as soon as Fn is
-    /// confirmed and undo it just as fast: chords are spotted via per-key state
-    /// within ~80ms, and a short hold with no recording evidence rolls back.
+    /// Mute as soon as Fn is confirmed. Do not undo based on `keyState`:
+    /// holding Fn/Globe makes macOS report other keys (F-keys, even arrows) as
+    /// down, which cancelled every real dictation. Terminal Fn+arrow will mute
+    /// for the hold; that is the trade-off the voice path needs.
     func pollFn() {
-        guard Self.legacyHoldMilliseconds == nil, fnGate.held else { return }
+        guard Self.legacyHoldMilliseconds == nil, fnGate.held, !duckedByUs else { return }
         let now = monotonicNanoseconds()
 
-        if duckedByUs {
-            guard now < companionProbeUntil, companionKeyDown() else { return }
-            companionProbeUntil = 0
-            suppressedUntilFnRelease = true
-            restoreWork?.cancel()
-            restoreWork = nil
-            log("Fn chord detected after duck; undoing mute")
-            applyDuck(false, reason: "fn-chord")
-            return
-        }
-
-        guard !suppressedUntilFnRelease else { return }
         guard now >= fnPressedAt, now - fnPressedAt >= Self.fnArmNanoseconds else { return }
         if !inputSourceIsDoubao {
             // The user can switch to Doubao while Fn is already held. Re-check,
@@ -515,84 +545,40 @@ private final class DuckController {
             guard inputSourceIsDoubao else { return }
         }
 
-        // Mute first, ask questions after. The chord probe below runs on the
-        // following ticks and undoes the mute if Fn turns out to be part of a
-        // shortcut; that keeps the leak at ~50ms instead of adding the probe's
-        // ~30ms in front of it.
         duckStartedByFn = true
-        companionProbeUntil = now + Self.companionProbeNanoseconds
         applyDuck(true, reason: "fn-\(durationMilliseconds(now - fnPressedAt))ms")
         if !duckedByUs {
             duckStartedByFn = false
-            companionProbeUntil = 0
         }
     }
 
-    /// Overlay and HAL are corroboration/sustain signals. They cannot start a
-    /// duck on their own, but after a recent Fn press they can — that covers
-    /// a click-to-record that never crosses the hold threshold.
-    /// Cheap gate check on `queue`; the probing itself is handed to `scanQueue`.
+    /// Sample Doubao's own capture state regardless of keyboard flags.
+    /// Window geometry and the shared Function flag are not recording evidence.
     func requestSustainSample() {
-        let now = monotonicNanoseconds()
-        let fnRecent = fnGate.held || now < fnCorroborationDeadline
-        guard duckedByUs || fnRecent, !scanInFlight else { return }
+        guard !scanInFlight else { return }
         scanInFlight = true
         scanQueue.async { [weak self] in
             guard let self else { return }
-            let (overlayNow, info) = doubaoRecordingOverlayVisible()
             let halNow = doubaoHALCapturing()
             self.queue.async {
                 self.scanInFlight = false
-                self.applySustainSample(overlayNow: overlayNow, info: info, halNow: halNow)
+                self.applySustainSample(overlayNow: false, info: "", halNow: halNow)
             }
         }
     }
 
-    /// Runs on `queue` with the (slow) probe results already in hand.
+    /// Start on the first capture sample; debounce only the restore.
+    /// This intentionally also mutes background capture by Doubao, since HAL
+    /// does not distinguish its background capture from voice recognition.
     private func applySustainSample(overlayNow: Bool, info: String, halNow: Bool) {
-        let now = monotonicNanoseconds()
-
-        if overlayNow {
-            overlayStartedAt = overlayStartedAt ?? now
-            overlayInfo = info
-        } else {
-            overlayStartedAt = nil
-            overlayInfo = ""
-        }
-
+        if sustainActive != halNow { captureGeneration &+= 1 }
+        sustainActive = halNow
         if halNow {
-            halStartedAt = halStartedAt ?? now
-        } else {
-            halStartedAt = nil
-        }
-
-        let overlayStable = isStable(since: overlayStartedAt, now: now)
-        let halStable = isStable(since: halStartedAt, now: now)
-        let newSustainActive = overlayStable || halStable
-        if newSustainActive != sustainActive {
-            sustainActive = newSustainActive
-            if newSustainActive {
-                let reason = overlayStable ? "overlay[\(overlayInfo)]" : "hal"
-                sawRecordingEvidence = true
-                log("sustain on (\(reason))")
-            } else {
-                log("sustain off")
-            }
-        }
-
-        if !duckedByUs {
-            guard newSustainActive, currentInputSourceIsDoubao() else { return }
-            let reason = overlayStable ? "overlay[\(overlayInfo)]" : "hal"
-            sawRecordingEvidence = true
-            applyDuck(true, reason: reason)
-            return
-        }
-
-        if fnGate.held || sustainActive {
             restoreWork?.cancel()
             restoreWork = nil
+            applyDuck(true, reason: "doubao-capture")
         } else {
-            scheduleRestoreIfIdle(reason: "idle", delay: Self.standardRestoreDelay)
+            scheduleRestoreIfIdle(reason: "capture-ended", delay: Self.standardRestoreDelay)
         }
     }
 
@@ -624,20 +610,20 @@ private final class DuckController {
     }
 
     private func scheduleRestoreIfIdle(reason: String, delay: TimeInterval) {
-        guard duckedByUs, !fnGate.held, !sustainActive, restoreWork == nil else { return }
-        let generation = fnGate.generation
+        guard duckedByUs, !sustainActive, restoreWork == nil else { return }
+        let generation = captureGeneration
         let work = DispatchWorkItem { [weak self] in
             self?.restoreIfStillIdle(generation: generation, reason: reason)
         }
         restoreWork = work
         log("restore scheduled reason=\(reason) generation=\(generation) delayMs=\(Int(delay * 1000))")
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func restoreIfStillIdle(generation: UInt64, reason: String) {
         restoreWork = nil
-        guard generation == fnGate.generation, !fnGate.held, !sustainActive else {
-            log("restore skipped generation=\(generation) current=\(fnGate.generation) fnHeld=\(fnGate.held) sustain=\(sustainActive)")
+        guard generation == captureGeneration, !sustainActive else {
+            log("restore skipped generation=\(generation) current=\(captureGeneration) sustain=\(sustainActive)")
             return
         }
         applyDuck(false, reason: reason)
@@ -646,27 +632,32 @@ private final class DuckController {
     private func applyDuck(_ on: Bool, reason: String) {
         if on {
             if duckedByUs { return }
-            guard let before = systemMuteState() else {
+            guard let before = readMute() else {
                 log("DUCK failed (\(reason)): cannot read output mute state")
                 return
             }
             mutedBefore = before
-            if !mutedBefore && !setSystemMuted(true) { return }
+            if !mutedBefore && !writeMute(true) { return }
             duckedByUs = true
-            writeStatus("ducked \(reason)")
+            // Verify mute actually took effect
+            if let verify = readMute(), !verify {
+                log("DUCK verification FAILED: mute did not take effect")
+                duckedByUs = false
+                return
+            }
+            publishStatus("ducked \(reason)")
             log("DUCK on (\(reason)) mutedBefore=\(mutedBefore)")
         } else {
             if !duckedByUs { return }
             if !mutedBefore {
-                guard setSystemMuted(false) else {
+                guard writeMute(false) else {
                     log("DUCK restore failed (\(reason)); keeping ownership state")
                     return
                 }
             }
             duckedByUs = false
             duckStartedByFn = false
-            companionProbeUntil = 0
-            writeStatus("idle")
+            publishStatus("idle")
             log("DUCK off (\(reason)) restoredMuted=\(mutedBefore)")
         }
     }
@@ -676,35 +667,35 @@ private func combinedFnHeld() -> Bool {
     CGEventSource.flagsState(.combinedSessionState).contains(.maskSecondaryFn)
 }
 
-/// Keys people actually chord with Fn: arrows (Home/End/PageUp/PageDown),
-/// delete, F1..F12, brightness, keyboard backlight, volume and media keys.
-/// Holding Fn with any of these is a shortcut, never dictation.
+/// Keys people actually chord with Fn for navigation: arrows become
+/// Home/End/PageUp/PageDown, and Delete becomes forward-delete.
+///
+/// Do not put F1–F12 or IOKit NX_KEYTYPE media codes in this list.
+/// `CGEventSource.keyState` takes virtual key codes (`kVK_ANSI_*` /
+/// `kVK_F*`), not NX_KEYTYPE values. 14/16/17/18/21/22 are E/Y/T/1/4/6,
+/// and holding the Fn/Globe key itself makes F-keys look down — both of
+/// which unmuted every real dictation (~8 ms after DUCK on).
 private let companionKeyCodes: [CGKeyCode] = [
-    123, 124, 125, 126,                          // arrows
-    117, 51,                                     // forward delete, delete
-    122, 120, 99, 118, 96, 97, 98, 100, 101,     // F1..F9
-    109, 103, 111,                               // F10..F12
-    144, 145,                                    // brightness
-    21, 22, 149, 150,                            // keyboard backlight
-    72, 73, 74,                                  // volume down/up/mute
-    16, 17, 18,                                  // play-pause, next, previous
-    14,                                          // eject
+    123, 124, 125, 126, // arrows
+    117, 51,            // forward delete, delete
 ]
 
-/// hidSystemState only reports modifiers, so Fn alone and Fn+F1 look identical.
-/// CGEventSource.keyState exposes individual keys without installing an event
-/// tap, which keeps WindowServer out of the input path (see runDaemon).
-private func companionKeyDown() -> Bool {
-    for code in companionKeyCodes where CGEventSource.keyState(.combinedSessionState, key: code) {
-        return true
+/// hidSystemState flags only report modifiers, so Fn alone and Fn+Down look
+/// identical there. keyState exposes individual keys without an event tap.
+private func companionKeyDown() -> CGKeyCode? {
+    for code in companionKeyCodes {
+        if CGEventSource.keyState(.hidSystemState, key: code)
+            || CGEventSource.keyState(.combinedSessionState, key: code) {
+            return code
+        }
     }
-    return false
+    return nil
 }
 
 private func runSelfTest() {
     let threshold = UInt64(DuckController.fnHoldMilliseconds) * 1_000_000
     var gate = FnHoldGate(thresholdNanoseconds: threshold)
-    var failures: [String] = []
+    var failures = DuckController.captureRegressionTests()
 
     func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
         if !condition() { failures.append(message) }
@@ -723,8 +714,17 @@ private func runSelfTest() {
     expect(!gate.shouldArm(generation: gate.generation, at: newDownAt + threshold / 2), "rapid re-press armed too early")
     expect(gate.shouldArm(generation: gate.generation, at: newDownAt + threshold), "new hold did not arm after its own duration")
 
+    let companions = Set(companionKeyCodes)
+    expect(companions == Set([123, 124, 125, 126, 117, 51] as [CGKeyCode]), "companion list must stay arrows+delete")
+    for nxKeyTypeCollidingWithANSI in [14, 16, 17, 18, 21, 22] as [CGKeyCode] {
+        expect(!companions.contains(nxKeyTypeCollidingWithANSI), "NX_KEYTYPE \(nxKeyTypeCollidingWithANSI) collided with an ANSI key")
+    }
+    for functionKey in [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111] as [CGKeyCode] {
+        expect(!companions.contains(functionKey), "F-key \(functionKey) must not count as an Fn chord")
+    }
+
     if failures.isEmpty {
-        print("self-test passed holdThresholdMs=\(DuckController.fnHoldMilliseconds)")
+        print("self-test passed mode=\(DuckController.modeDescription)")
     } else {
         for failure in failures { print("self-test failed: \(failure)") }
         exit(1)
@@ -745,7 +745,12 @@ private func dumpDebug() {
     print("fnHeld=\(hardwareFnHeld()) hidSystemState")
     print("fnHeldCombined=\(combinedFnHeld())")
     print("duckMode=\(DuckController.modeDescription)")
-    print("fnHoldThresholdMs=\(DuckController.fnHoldMilliseconds)")
+    print("capturePollIntervalMs=20")
+    if let code = companionKeyDown() {
+        print("companionKeyDown=\(code)")
+    } else {
+        print("companionKeyDown=false")
+    }
     print("process objects:")
     for id in processObjectIDs() {
         let bid = audioString(id, kProcessBundleID) ?? "?"
@@ -784,22 +789,8 @@ private func acquireSingletonLock() {
 private func runDaemon() {
     acquireSingletonLock()
     log("started pid=\(ProcessInfo.processInfo.processIdentifier) mode=\(DuckController.modeDescription)")
-    // A previous instance may have been killed mid-duck and left the system
-    // muted. If Doubao shows no recording activity right now, unmute once.
-    if let muted = systemMuteState(), muted {
-        let overlay = doubaoRecordingOverlayVisible().0
-        let hal = doubaoHALCapturing()
-        if !overlay && !hal && !hardwareFnHeld() {
-            _ = setSystemMuted(false)
-            log("startup: found system muted with no Doubao activity; unmuted")
-        } else {
-            log("startup: system muted, but Doubao appears active; leaving as-is")
-        }
-    }
+    // Preserve pre-existing user mute. Only undo mute owned by this instance.
     writeStatus("idle")
-    // Warm the text-input XPC connection so the first real press does not pay
-    // the ~33ms connection setup that currentInputSourceIsDoubao() costs cold.
-    _ = currentInputSourceIsDoubao()
     let duck = DuckController()
 
     let names = [
@@ -823,28 +814,15 @@ private func runDaemon() {
         }
     }
 
-    // Both timers live on the input queue, not the main runloop: the overlay
-    // scan is slow enough to push a main-thread timer past the point where
-    // muting still helps.
-    let sustainTimer = DispatchSource.makeTimerSource(queue: duck.queue)
-    sustainTimer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
-    sustainTimer.setEventHandler { duck.requestSustainSample() }
-    sustainTimer.resume()
-
-    // The Fn path runs on its own thread with a sleep loop, not a timer.
-    // Measured in this launchd background job: both main-runloop timers and
-    // dispatch timers get quantised/coalesced, which stretched the 40ms arm to
-    // 60-85ms and left the first ~0.1s of playback in Doubao's capture.
-    // usleep() is a plain kernel sleep, so the arm lands where it was scheduled.
-    // Idle polls at 5ms (detection latency) and 2ms while hot. Cost is a
-    // flagsState() call every few ms — well under 0.1% CPU.
+    // Poll capture on a dedicated thread. No keyboard monitoring or window
+    // enumeration on the mute path. One scan in flight bounds the work.
     let inputThread = Thread {
         while !Thread.current.isCancelled {
-            let hot = duck.queue.sync { duck.pollInput() }
-            usleep(hot ? 2_000 : 5_000)
+            duck.queue.sync { duck.requestSustainSample() }
+            usleep(20_000)
         }
     }
-    inputThread.name = "com.doubao.audio-duck.input-poll"
+    inputThread.name = "com.doubao.audio-duck.capture-poll"
     inputThread.qualityOfService = .userInteractive
     inputThread.stackSize = 256 * 1024
     inputThread.start()
@@ -860,10 +838,8 @@ private func runDaemon() {
     srcInt.setEventHandler { duck.emergencyRestore("SIGINT") }
     srcInt.resume()
 
-    withExtendedLifetime(sustainTimer) {
-        withExtendedLifetime(inputThread) {
-            RunLoop.main.run()
-        }
+    withExtendedLifetime(inputThread) {
+        RunLoop.main.run()
     }
 }
 
@@ -889,7 +865,7 @@ if args.contains("--self-test") {
     print("restored")
 } else if args.contains("--probe-keys") {
     // Diagnostic for the Fn-chord check. CGEventSource.keyState is what lets the
-    // daemon tell "Fn alone" from "Fn+F1": hold a key (or a chord) while this
+    // daemon tell "Fn alone" from "Fn+Down": hold a key (or a chord) while this
     // runs to confirm macOS reports per-key state to this binary.
     print("sampling key state for 8s — hold the key/chord you want to test…")
     let deadline = Date().addingTimeInterval(8)
