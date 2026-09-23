@@ -5,11 +5,16 @@ import Carbon
 import AppKit
 import Darwin
 
-/// Ducks (mutes) system output while Doubao IME is recording.
+/// Ducks (mutes) system output while a supported IME is recording.
 /// MicPause cannot see IME capture and cannot pause webpage players.
 /// Muting the default output silences Safari/Chrome/any app, then restores.
 
 private let doubaoBundleID = "com.bytedance.inputmethod.doubaoime"
+private let weTypeBundleID = "com.tencent.inputmethod.wetype"
+private let captureReasonsByBundleID = [
+    doubaoBundleID: "doubao-capture",
+    weTypeBundleID: "wetype-capture",
+]
 private let logPath = NSHomeDirectory() + "/Library/Logs/doubao-audio-duck.log"
 private let statusPath = "/tmp/doubao-audio-duck.status"
 private let logDateFormatter: ISO8601DateFormatter = {
@@ -134,13 +139,22 @@ private func processObjectIDs() -> [AudioObjectID] {
     return ids
 }
 
-private func doubaoHALCapturing() -> Bool {
+private func activeInputMethodCaptureReason() -> String? {
     for id in processObjectIDs() {
-        let bid = audioString(id, kProcessBundleID) ?? ""
-        if bid == doubaoBundleID {
-            if (audioUInt32(id, kProcessIsRunningInput) ?? 0) != 0 {
-                return true
-            }
+        let bundleID = audioString(id, kProcessBundleID) ?? ""
+        guard let reason = captureReasonsByBundleID[bundleID] else { continue }
+        if (audioUInt32(id, kProcessIsRunningInput) ?? 0) != 0 {
+            return reason
+        }
+    }
+    return nil
+}
+
+private func inputMethodHALCapturing(bundleID: String) -> Bool {
+    for id in processObjectIDs() {
+        guard audioString(id, kProcessBundleID) == bundleID else { continue }
+        if (audioUInt32(id, kProcessIsRunningInput) ?? 0) != 0 {
+            return true
         }
     }
     return false
@@ -329,42 +343,56 @@ private final class DuckController {
     static func captureRegressionTests() -> [String] {
         var muted = false
         var writes: [Bool] = []
+        var statuses: [String] = []
         let controller = DuckController(readMute: { muted }, writeMute: {
             muted = $0; writes.append($0); return true
-        }, publishStatus: { _ in })
+        }, publishStatus: { statuses.append($0) })
         var failures: [String] = []
         controller.queue.sync {
             // Replay capture without an Fn edge. The first sample must mute.
-            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
+            controller.applySustainSample(captureReason: "doubao-capture")
             if !muted { failures.append("Doubao capture without Fn did not mute immediately") }
-            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
+            if statuses.last != "ducked doubao-capture" { failures.append("Doubao capture published the wrong status") }
+            controller.applySustainSample(captureReason: "doubao-capture")
             if writes != [true] { failures.append("active capture must mute exactly once") }
-            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            controller.applySustainSample(captureReason: nil)
             if !muted { failures.append("audio restored before release grace period") }
             controller.restoreWork?.cancel()
             controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
             if muted { failures.append("capture stop did not restore audio") }
-            controller.applySustainSample(overlayNow: true, info: "candidate", halNow: false)
-            if muted { failures.append("window alone incorrectly muted audio") }
+            controller.applySustainSample(captureReason: nil)
+            if muted { failures.append("idle sample incorrectly muted audio") }
             controller.restoreWork?.cancel()
+        }
+        muted = false
+        writes = []
+        statuses = []
+        controller.queue.sync {
+            controller.applySustainSample(captureReason: "wetype-capture")
+            if !muted { failures.append("WeType capture did not mute immediately") }
+            if statuses.last != "ducked wetype-capture" { failures.append("WeType capture published the wrong status") }
+            controller.applySustainSample(captureReason: nil)
+            controller.restoreWork?.cancel()
+            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
+            if muted { failures.append("WeType capture stop did not restore audio") }
         }
         muted = true
         writes = []
         controller.queue.sync {
-            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
-            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            controller.applySustainSample(captureReason: "doubao-capture")
+            controller.applySustainSample(captureReason: nil)
             controller.restoreWork?.cancel()
             controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
             if !muted || !writes.isEmpty { failures.append("pre-existing mute was changed") }
         }
         muted = false
         controller.queue.sync {
-            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
-            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            controller.applySustainSample(captureReason: "doubao-capture")
+            controller.applySustainSample(captureReason: nil)
             let stale = controller.captureGeneration
             controller.restoreWork?.cancel()
-            controller.applySustainSample(overlayNow: false, info: "", halNow: true)
-            controller.applySustainSample(overlayNow: false, info: "", halNow: false)
+            controller.applySustainSample(captureReason: "wetype-capture")
+            controller.applySustainSample(captureReason: nil)
             controller.restoreWork?.cancel()
             controller.restoreIfStillIdle(generation: stale, reason: "self-test-stale")
             if !muted { failures.append("stale restore unmuted a new recording") }
@@ -418,7 +446,7 @@ private final class DuckController {
         legacyHoldMilliseconds ?? fnConfirmMilliseconds
     }
 
-    static var modeDescription: String { "doubao-capture" }
+    static var modeDescription: String { "ime-capture" }
 
     private static let fnArmNanoseconds = UInt64(fnConfirmMilliseconds) * 1_000_000
     /// Gate threshold — only the conservative legacy path still consults it.
@@ -552,31 +580,32 @@ private final class DuckController {
         }
     }
 
-    /// Sample Doubao's own capture state regardless of keyboard flags.
+    /// Sample supported input methods' capture state regardless of keyboard flags.
     /// Window geometry and the shared Function flag are not recording evidence.
     func requestSustainSample() {
         guard !scanInFlight else { return }
         scanInFlight = true
         scanQueue.async { [weak self] in
             guard let self else { return }
-            let halNow = doubaoHALCapturing()
+            let captureReason = activeInputMethodCaptureReason()
             self.queue.async {
                 self.scanInFlight = false
-                self.applySustainSample(overlayNow: false, info: "", halNow: halNow)
+                self.applySustainSample(captureReason: captureReason)
             }
         }
     }
 
     /// Start on the first capture sample; debounce only the restore.
-    /// This intentionally also mutes background capture by Doubao, since HAL
-    /// does not distinguish its background capture from voice recognition.
-    private func applySustainSample(overlayNow: Bool, info: String, halNow: Bool) {
-        if sustainActive != halNow { captureGeneration &+= 1 }
-        sustainActive = halNow
-        if halNow {
+    /// This intentionally also mutes background capture by a monitored input
+    /// method, since HAL cannot distinguish it from voice recognition.
+    private func applySustainSample(captureReason: String?) {
+        let capturing = captureReason != nil
+        if sustainActive != capturing { captureGeneration &+= 1 }
+        sustainActive = capturing
+        if let captureReason {
             restoreWork?.cancel()
             restoreWork = nil
-            applyDuck(true, reason: "doubao-capture")
+            applyDuck(true, reason: captureReason)
         } else {
             scheduleRestoreIfIdle(reason: "capture-ended", delay: Self.standardRestoreDelay)
         }
@@ -737,7 +766,8 @@ private func dumpDebug() {
     } else {
         print("systemMuted=unknown")
     }
-    print("doubaoHALCapturing=\(doubaoHALCapturing())")
+    print("doubaoHALCapturing=\(inputMethodHALCapturing(bundleID: doubaoBundleID))")
+    print("wetypeHALCapturing=\(inputMethodHALCapturing(bundleID: weTypeBundleID))")
     let overlay = doubaoRecordingOverlayVisible()
     print("doubaoRecordingOverlayVisible=\(overlay.0) \(overlay.1)")
     print("(recording overlay ignores bars parked flush with a screen's right edge)")
@@ -814,8 +844,9 @@ private func runDaemon() {
         }
     }
 
-    // Poll capture on a dedicated thread. No keyboard monitoring or window
-    // enumeration on the mute path. One scan in flight bounds the work.
+    // Poll supported input-method capture on a dedicated thread. No keyboard
+    // monitoring or window enumeration on the mute path. One scan in flight
+    // bounds the work.
     let inputThread = Thread {
         while !Thread.current.isCancelled {
             duck.queue.sync { duck.requestSustainSample() }
