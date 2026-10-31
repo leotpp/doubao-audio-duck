@@ -11,7 +11,7 @@
 两种触发方式，自动二选一：
 
 1. **认物理键**（首选）：直接读原始 HID 键流，所以连输入法自己吞掉的按住说话键也能看见。
-2. **看麦克风**（降级）：没有「输入监控」权限时，改为监听微信输入法 / 豆包是否正在占用麦克风，占麦即静音，放开即恢复。**不需要任何系统权限。** 只看这两个输入法（`com.tencent.inputmethod.wetype`、`com.bytedance.inputmethod.doubaoime`），**其它 App 用麦克风不会触发**。
+2. **看麦克风**（降级）：没有「输入监控」权限时，改为监听微信输入法 / 豆包是否正在占用麦克风，占麦即静音，放开即恢复。**不需要任何系统权限。** 只看这两个输入法（`com.tencent.inputmethod.wetype`、`com.bytedance.inputmethod.doubaoime`），**其它 App 用麦克风不会触发**。每 5ms 查一次占麦状态，目标进程列表每 500ms 刷新一次。
 
 当前用的是哪种，`--dump` 和状态文件里都有：`recognitionMode=precise-key` 或 `degraded-cg-or-ime-capture`。
 
@@ -67,7 +67,7 @@ private let fallbackHoldKey = CGKeyCode(kVK_RightControl)
 
 ```bash
 ~/.local/bin/doubao-audio-duck --dump          # 用了哪个键、走哪种模式、权限与状态
-~/.local/bin/doubao-audio-duck --self-test     # 46 条断言自检，不动系统声音
+~/.local/bin/doubao-audio-duck --self-test     # 57 条断言自检，不动系统声音
 ~/.local/bin/doubao-audio-duck --probe-keys    # 只采样按键，不静音
 ~/.local/bin/doubao-audio-duck --force-unmute  # 卡住静音时强制解除
 tail -30 ~/Library/Logs/doubao-audio-duck.log

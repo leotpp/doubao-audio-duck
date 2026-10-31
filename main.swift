@@ -280,37 +280,95 @@ private struct CaptureSnapshot {
     }
 }
 
-private func captureSnapshot() -> CaptureSnapshot {
-    func address(_ selector: UInt32) -> AudioObjectPropertyAddress {
-        AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-    }
-    var listAddress = address(0x70727323) // prs#
+private let capturePollIntervalNs: UInt64 = 5_000_000
+private let captureEnumerationIntervalNs: UInt64 = 500_000_000
+
+private func captureAddress(_ selector: UInt32) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+}
+
+private struct CaptureProcess {
+    let id: AudioObjectID
+    let bundle: String
+}
+
+private enum CaptureEnumeration {
+    case success([CaptureProcess])
+    case failure(String)
+}
+
+private func enumerateCaptureProcesses() -> CaptureEnumeration {
+    var listAddress = captureAddress(0x70727323) // prs#
     let system = AudioObjectID(kAudioObjectSystemObject)
     var size: UInt32 = 0
     let sizeResult = AudioObjectGetPropertyDataSize(system, &listAddress, 0, nil, &size)
-    guard sizeResult == noErr else { return CaptureSnapshot(available: false, problem: "prs#-size:\(sizeResult)") }
-    guard size > 0 else { return CaptureSnapshot(available: true) }
+    guard sizeResult == noErr else { return .failure("prs#-size:\(sizeResult)") }
+    guard size > 0 else { return .success([]) }
     var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
     let listResult = AudioObjectGetPropertyData(system, &listAddress, 0, nil, &size, &ids)
-    guard listResult == noErr else { return CaptureSnapshot(available: false, problem: "prs#-read:\(listResult)") }
-    var processes: [(String, UInt32?)] = []
+    guard listResult == noErr else { return .failure("prs#-read:\(listResult)") }
+    var processes: [CaptureProcess] = []
     for id in ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size) {
-        var bundleAddress = address(0x70626964) // pbid
+        var bundleAddress = captureAddress(0x70626964) // pbid
         var bundle: Unmanaged<CFString>?
         var bundleSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let result = AudioObjectGetPropertyData(id, &bundleAddress, 0, nil, &bundleSize, &bundle)
-        guard result == noErr, let bundle else {
-            return CaptureSnapshot(available: false, problem: "pbid-read:\(result)")
-        }
+        guard result == noErr, let bundle else { return .failure("pbid-read:\(result)") }
         let name = bundle.takeUnretainedValue() as String
-        guard supportedCaptureBundles.contains(name) else { continue }
-        var inputAddress = address(0x70697269) // piri
-        var input: UInt32 = 0
-        var inputSize = UInt32(MemoryLayout<UInt32>.size)
-        let inputResult = AudioObjectGetPropertyData(id, &inputAddress, 0, nil, &inputSize, &input)
-        processes.append((name, inputResult == noErr ? input : nil))
+        if supportedCaptureBundles.contains(name) { processes.append(CaptureProcess(id: id, bundle: name)) }
     }
-    return CaptureSnapshot.select(processes)
+    return .success(processes)
+}
+
+private func captureInput(_ id: AudioObjectID) -> UInt32? {
+    var inputAddress = captureAddress(0x70697269) // piri
+    var input: UInt32 = 0
+    var inputSize = UInt32(MemoryLayout<UInt32>.size)
+    return AudioObjectGetPropertyData(id, &inputAddress, 0, nil, &inputSize, &input) == noErr ? input : nil
+}
+
+// Confined to the capture queue. Refreshes can still stall a query; newly created
+// process objects can take one enumeration interval to discover. The 5ms target
+// applies to cache hits, not to initial discovery or HAL enumeration spikes.
+private final class CaptureQuery {
+    private let enumerate: () -> CaptureEnumeration
+    private let readInput: (AudioObjectID) -> UInt32?
+    private var processes: [CaptureProcess] = []
+    private var lastEnumeration: UInt64?
+
+    init(enumerate: @escaping () -> CaptureEnumeration = enumerateCaptureProcesses,
+         readInput: @escaping (AudioObjectID) -> UInt32? = captureInput) {
+        self.enumerate = enumerate
+        self.readInput = readInput
+    }
+
+    func captureSnapshot(now: UInt64 = DispatchTime.now().uptimeNanoseconds) -> CaptureSnapshot {
+        func refresh() -> String? {
+            processes = []
+            lastEnumeration = nil
+            switch enumerate() {
+            case .success(let values):
+                processes = values
+                lastEnumeration = now
+                return nil
+            case .failure(let problem): return problem
+            }
+        }
+        if processes.isEmpty || lastEnumeration.map({ now - $0 >= captureEnumerationIntervalNs }) != false {
+            if let problem = refresh() { return CaptureSnapshot(available: false, problem: problem) }
+        }
+        func sample() -> CaptureSnapshot {
+            CaptureSnapshot.select(processes.map { ($0.bundle, readInput($0.id)) })
+        }
+        let result = sample()
+        guard !result.available else { return result }
+        // An object may have disappeared. Re-enumerate and retry only once;
+        // never publish stale active state or loop indefinitely on HAL failures.
+        if let problem = refresh() { return CaptureSnapshot(available: false, problem: problem) }
+        let retried = sample()
+        if !retried.available { processes = []; lastEnumeration = nil }
+        return retried
+    }
 }
 
 private func recognitionMode(hidStarted: Bool) -> String { hidStarted ? "precise-key" : "degraded-cg-or-ime-capture" }
@@ -322,6 +380,7 @@ private func triggerHeld(keyDown: Bool, hidStarted: Bool, capture: CaptureSnapsh
 // Only one HAL query can be in flight; results and all controller state belong to main.
 private final class CaptureMonitor {
     private let queue = DispatchQueue(label: "com.doubao.audio-duck.capture")
+    private let query = CaptureQuery()
     private var inFlight = false
     private var lastQuery: UInt64 = 0
     private var lastSummary = ""
@@ -329,10 +388,10 @@ private final class CaptureMonitor {
 
     func poll() {
         let now = DispatchTime.now().uptimeNanoseconds
-        guard !inFlight, now - lastQuery >= 20_000_000 else { return }
+        guard !inFlight, now - lastQuery >= capturePollIntervalNs else { return }
         lastQuery = now; inFlight = true
         queue.async {
-            let result = captureSnapshot()
+            let result = self.query.captureSnapshot()
             DispatchQueue.main.async {
                 self.inFlight = false
                 self.snapshot = result
@@ -474,7 +533,7 @@ private func runDaemon() {
     log("shortcut \(shortcut.summary) holdKeys=\(shortcut.keys) keyPollIntervalMs=5")
     if !hidStarted {
         log("ERROR 物理按键通道不可用，精确按键模式此刻无效；启用 CG 或输入法采麦降级。运行 ~/.local/bin/doubao-audio-duck --grant")
-        log("degraded capturePollIntervalMs=20; background pre-capture/click recording can mute until capture stops; release timing is approximate")
+        log("degraded capturePollIntervalMs=\(capturePollIntervalNs / 1_000_000) captureEnumerationIntervalMs=\(captureEnumerationIntervalNs / 1_000_000); background pre-capture/click recording can mute until capture stops; release timing is approximate")
     }
     let capture = CaptureMonitor()
     var audioStatus = "idle"
@@ -672,6 +731,66 @@ private func runSelfTest() {
         duck.update(held: triggerHeld(keyDown: false, hidStarted: false, capture: unknownCapture))
         expect(audio.writes == [true, false], "unknown capture unexpectedly muted")
     }
+    do {
+        let process = CaptureProcess(id: 1, bundle: "com.tencent.inputmethod.wetype")
+        var enumerations = 0
+        var reads: [AudioObjectID] = []
+        var value: UInt32 = 0
+        let query = CaptureQuery(enumerate: {
+            enumerations += 1
+            return .success([process])
+        }, readInput: { id in reads.append(id); return value })
+        expect(query.captureSnapshot(now: 0).available && enumerations == 1 && reads == [1], "first capture query did not enumerate and sample")
+        value = 1
+        expect(query.captureSnapshot(now: 5_000_000).capturing && enumerations == 1 && reads == [1, 1], "cache hit did not sample without enumeration")
+        _ = query.captureSnapshot(now: captureEnumerationIntervalNs - 1)
+        expect(enumerations == 1, "cache expired before its boundary")
+        expect(query.captureSnapshot(now: captureEnumerationIntervalNs).capturing && enumerations == 2, "cache did not refresh exactly at expiry")
+    }
+    do {
+        var enumerations = 0
+        let query = CaptureQuery(enumerate: { enumerations += 1; return .success([]) },
+                                 readInput: { _ in failures.append("empty cache read an object"); return nil })
+        let first = query.captureSnapshot(now: 0)
+        let next = query.captureSnapshot(now: 1)
+        expect(first.available && !first.capturing && next.available && enumerations == 2, "empty cache was not retried on next query")
+    }
+    do {
+        let process = CaptureProcess(id: 1, bundle: "com.tencent.inputmethod.wetype")
+        let replacement = CaptureProcess(id: 2, bundle: "com.bytedance.inputmethod.doubaoime")
+        var enumerations = 0
+        var missing = false
+        var refreshFailure = false
+        var reads: [AudioObjectID] = []
+        let query = CaptureQuery(enumerate: {
+            enumerations += 1
+            if refreshFailure { return .failure("prs#-read:test") }
+            return .success([missing ? replacement : process])
+        }, readInput: { id in
+            reads.append(id)
+            return missing && id == 1 ? nil : 1
+        })
+        expect(query.captureSnapshot(now: 0).capturing, "disappearance fixture did not start active")
+        missing = true
+        let replaced = query.captureSnapshot(now: 1)
+        expect(replaced.bundles == [replacement.bundle] && enumerations == 2 && reads == [1, 1, 2], "missing process did not immediately refresh and read replacement once")
+        refreshFailure = true
+        let failed = query.captureSnapshot(now: captureEnumerationIntervalNs + 1)
+        expect(!failed.available && !failed.capturing && failed.problem == "prs#-read:test", "failed refresh published stale capture")
+        refreshFailure = false
+        expect(query.captureSnapshot(now: captureEnumerationIntervalNs + 2).capturing && enumerations == 4, "failed refresh did not recover on next query")
+    }
+    do {
+        let process = CaptureProcess(id: 1, bundle: "com.tencent.inputmethod.wetype")
+        var enumerations = 0
+        var value: UInt32? = nil
+        let query = CaptureQuery(enumerate: { enumerations += 1; return .success([process]) },
+                                 readInput: { _ in value })
+        let failed = query.captureSnapshot(now: 0)
+        expect(!failed.available && failed.problem == "piri-read-failed" && enumerations == 2, "persistent piri failure did not stop after one retry")
+        value = 1
+        expect(query.captureSnapshot(now: 1).capturing && enumerations == 3, "persistent piri failure did not invalidate cache for recovery")
+    }
     if failures.isEmpty {
         print("self-test passed: \(assertions) assertions (hold, ownership, MMKV, permissions, capture fallback)")
     } else {
@@ -692,8 +811,8 @@ private func dumpDebug() {
     _ = hid.start()
     print("diagnosticHidStarted=\(hid.started) hidOpenResult=\(hid.openDescription)")
     print("diagnosticRecognitionMode=\(recognitionMode(hidStarted: hid.started))")
-    print(captureSnapshot().summary)
-    print("capturePollIntervalMs=20 (degraded mode only)")
+    print(CaptureQuery().captureSnapshot().summary)
+    print("capturePollIntervalMs=\(capturePollIntervalNs / 1_000_000) captureEnumerationIntervalMs=\(captureEnumerationIntervalNs / 1_000_000) (degraded mode only)")
     print("duckMode=\(modeDescription)")
     print("keyPollIntervalMs=5")
     if let text = try? String(contentsOfFile: statusPath, encoding: .utf8) {
