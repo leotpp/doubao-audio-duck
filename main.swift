@@ -2,34 +2,21 @@ import Foundation
 import CoreAudio
 import CoreGraphics
 import Carbon
-import AppKit
 import Darwin
+import IOKit.hid
 
-/// Ducks (mutes) system output while a supported IME is recording.
-/// MicPause cannot see IME capture and cannot pause webpage players.
-/// Muting the default output silences Safari/Chrome/any app, then restores.
-
-private let doubaoBundleID = "com.bytedance.inputmethod.doubaoime"
-private let weTypeBundleID = "com.tencent.inputmethod.wetype"
-private let captureReasonsByBundleID = [
-    doubaoBundleID: "doubao-capture",
-    weTypeBundleID: "wetype-capture",
-]
+private let fallbackHoldKey = CGKeyCode(kVK_RightControl)
 private let logPath = NSHomeDirectory() + "/Library/Logs/doubao-audio-duck.log"
 private let statusPath = "/tmp/doubao-audio-duck.status"
+private let settingsPath = NSHomeDirectory() + "/Library/Application Support/WeType/mmkv/wetype.settings"
+private let modeDescription = "hold-key"
 private let logDateFormatter: ISO8601DateFormatter = {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return formatter
 }()
 
-private let kProcessObjectList: AudioObjectPropertySelector = 0x70727323 // 'prs#'
-private let kProcessPID: AudioObjectPropertySelector = 0x70706964        // 'ppid'
-private let kProcessBundleID: AudioObjectPropertySelector = 0x70626964   // 'pbid'
-private let kProcessIsRunningInput: AudioObjectPropertySelector = 0x70697269 // 'piri'
-
 private func log(_ msg: String) {
-    // Self-tests exercise the controller with a fake audio backend.
     guard !CommandLine.arguments.contains("--self-test") else { return }
     let line = logDateFormatter.string(from: Date()) + "  " + msg + "\n"
     if let data = line.data(using: .utf8) {
@@ -50,7 +37,6 @@ private func writeStatus(_ s: String) {
 }
 
 private func defaultOutputDevice() -> AudioDeviceID? {
-    let system = AudioObjectID(kAudioObjectSystemObject)
     var address = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultOutputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -58,7 +44,7 @@ private func defaultOutputDevice() -> AudioDeviceID? {
     )
     var device: AudioDeviceID = kAudioObjectUnknown
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    let status = AudioObjectGetPropertyData(system, &address, 0, nil, &size, &device)
+    let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
     return status == noErr && device != kAudioObjectUnknown ? device : nil
 }
 
@@ -81,679 +67,613 @@ private func systemMuteState() -> Bool? {
 
 @discardableResult
 private func setSystemMuted(_ muted: Bool) -> Bool {
-    guard let device = defaultOutputDevice() else {
-        log("output mute unavailable: no default output device")
-        return false
-    }
+    guard let device = defaultOutputDevice() else { return false }
     var address = outputMuteAddress()
     var value: UInt32 = muted ? 1 : 0
-    let size = UInt32(MemoryLayout<UInt32>.size)
-    let status = AudioObjectSetPropertyData(device, &address, 0, nil, size, &value)
-    if status != noErr {
-        log("output mute failed muted=\(muted) status=\(status)")
-        return false
+    return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value) == noErr
+}
+
+private enum SettingsError: Error { case invalid(String) }
+
+private struct ByteReader {
+    let bytes: [UInt8]
+    var index = 0
+    var isAtEnd: Bool { index == bytes.count }
+
+    mutating func number() throws -> UInt64 {
+        var value: UInt64 = 0
+        for shift in stride(from: 0, through: 63, by: 7) {
+            guard index < bytes.count else { throw SettingsError.invalid("truncated varint") }
+            let byte = bytes[index]; index += 1
+            guard shift != 63 || byte <= 1 else { throw SettingsError.invalid("varint overflow") }
+            value |= UInt64(byte & 0x7f) << shift
+            if byte & 0x80 == 0 { return value }
+        }
+        throw SettingsError.invalid("varint overflow")
     }
-    return true
+
+    mutating func blob() throws -> [UInt8] {
+        let count = try number()
+        guard count <= UInt64(bytes.count - index) else { throw SettingsError.invalid("truncated value") }
+        let end = index + Int(count)
+        defer { index = end }
+        return Array(bytes[index..<end])
+    }
 }
 
-private func audioUInt32(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
-    var addr = AudioObjectPropertyAddress(
-        mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var value: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    let status = AudioObjectGetPropertyData(object, &addr, 0, nil, &size, &value)
-    return status == noErr ? value : nil
+private let shortcutSettingNames: Set<String> = [
+    "voicePTTHotKey", "voicePTTShortcut_keyCodes", "voicePTTShortcut_modifiers", "voicePTTShortcut_tapCount"
+]
+
+private func shortcutSettings(_ data: Data) throws -> [String: [UInt8]] {
+    let bytes = Array(data)
+    guard bytes.count >= 5 else { throw SettingsError.invalid("missing MMKV header") }
+    let size = (0..<4).reduce(UInt64(0)) { $0 | UInt64(bytes[$1]) << ($1 * 8) }
+    guard size > 0, size <= UInt64(bytes.count - 4) else { throw SettingsError.invalid("invalid MMKV length") }
+    // shortcut: WeType 的 MMKV 布局来自逆向与上游格式，升级变更时需更新；失败回退右 Ctrl。
+    var reader = ByteReader(bytes: Array(bytes[4..<(4 + Int(size))]))
+    _ = try reader.number()
+    var values: [String: [UInt8]] = [:]
+    while !reader.isAtEnd {
+        guard let key = String(bytes: try reader.blob(), encoding: .utf8), !key.isEmpty else {
+            throw SettingsError.invalid("invalid MMKV key")
+        }
+        let value = try reader.blob()
+        if shortcutSettingNames.contains(key) {
+            if value.isEmpty { values.removeValue(forKey: key) } else { values[key] = value }
+        }
+    }
+    return values
 }
 
-private func audioString(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
-    var addr = AudioObjectPropertyAddress(
-        mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
+private struct HoldShortcut {
+    var key = fallbackHoldKey
+    var source = "fallback"
+    var reason = ""
+    var keyCodes: [UInt16]?
+    var modifiers: UInt64?
+    var tapCount: UInt64?
+
+    static func decode(_ data: Data) -> HoldShortcut {
+        var result = HoldShortcut()
+        do {
+            let values = try shortcutSettings(data)
+            func number(_ name: String) throws -> UInt64 {
+                guard let bytes = values[name] else { throw SettingsError.invalid("missing \(name)") }
+                var reader = ByteReader(bytes: bytes)
+                let value = try reader.number()
+                guard reader.isAtEnd else { throw SettingsError.invalid("invalid \(name)") }
+                return value
+            }
+            let enabled = try number("voicePTTHotKey")
+            guard let rawKeys = values["voicePTTShortcut_keyCodes"] else { throw SettingsError.invalid("missing keyCodes") }
+            var reader = ByteReader(bytes: rawKeys)
+            let json = try reader.blob()
+            guard reader.isAtEnd else { throw SettingsError.invalid("invalid keyCodes length") }
+            let keys = try JSONDecoder().decode([UInt16].self, from: Data(json))
+            result.keyCodes = keys
+            result.modifiers = try number("voicePTTShortcut_modifiers")
+            result.tapCount = try number("voicePTTShortcut_tapCount")
+            guard enabled == 1 else { throw SettingsError.invalid("WeType push-to-talk disabled") }
+            guard result.tapCount == 1, keys.count == 1, let key = keys.first, key < 128 else {
+                throw SettingsError.invalid("shortcut is not a single hold key")
+            }
+            let modifierForKey: [UInt16: UInt64] = [
+                54: 1 << 8, 55: 1 << 8, 56: 1 << 9, 60: 1 << 9,
+                58: 1 << 11, 61: 1 << 11, 59: 1 << 12, 62: 1 << 12
+            ]
+            guard key != 63, result.modifiers == (modifierForKey[key] ?? 0) else {
+                throw SettingsError.invalid("unsupported modifier combination")
+            }
+            result.key = key
+            result.source = "wetype"
+        } catch SettingsError.invalid(let message) {
+            result.reason = message
+        } catch {
+            result.reason = "invalid WeType shortcut encoding"
+        }
+        return result
+    }
+
+    static func load() -> HoldShortcut {
+        do { return decode(try Data(contentsOf: URL(fileURLWithPath: settingsPath))) }
+        catch { return HoldShortcut(reason: "cannot read WeType settings") }
+    }
+
+    // 本机蓝牙键盘把右 Ctrl 报成 59（实测），左右两侧一起监听才能匹配输入法实际收到的键。
+    var keys: [CGKeyCode] { key == 59 || key == 62 ? [59, 62] : [key] }
+
+    var summary: String {
+        "holdKey=\(key) source=\(source) keyCodes=\(keyCodes.map { String(describing: $0) } ?? "unknown") modifiers=\(modifiers.map { String($0) } ?? "unknown") tapCount=\(tapCount.map { String($0) } ?? "unknown")" + (reason.isEmpty ? "" : " fallbackReason=\(reason)")
+    }
+}
+
+// 输入法会吞掉自己的按住说话热键，CGEventSource 看不到；原始 HID 层不受影响。
+private final class HIDKeyMonitor {
+    private var manager: IOHIDManager?
+    private var down = Set<CGKeyCode>()
+    private(set) var started = false
+    private(set) var openResult: IOReturn?
+
+    static func describeAccess(_ access: IOHIDAccessType) -> String {
+        switch access {
+        case kIOHIDAccessTypeGranted: return "granted"
+        case kIOHIDAccessTypeDenied: return "denied"
+        default: return "unknown"
+        }
+    }
+
+    static var accessDescription: String { describeAccess(IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)) }
+
+    @discardableResult
+    static func requestIfNeeded() -> String {
+        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+            let accepted = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            log("input monitoring request returned=\(accepted) hidInput=\(accessDescription); GUI approval may still be required")
+        }
+        return accessDescription
+    }
+
+    var openDescription: String {
+        openResult.map { "\($0) (0x" + String(UInt32(bitPattern: $0), radix: 16) + ")" } ?? "not-attempted"
+    }
+
+    func start() -> Bool {
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerSetDeviceMatching(manager, [
+            kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop,
+            kIOHIDDeviceUsageKey: kHIDUsage_GD_Keyboard
+        ] as CFDictionary)
+        IOHIDManagerRegisterInputValueCallback(manager, { context, result, _, value in
+            guard result == kIOReturnSuccess, let context else { return }
+            Unmanaged<HIDKeyMonitor>.fromOpaque(context).takeUnretainedValue().handle(value)
+        }, Unmanaged.passUnretained(self).toOpaque())
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        self.openResult = openResult
+        self.manager = manager
+        started = openResult == kIOReturnSuccess
+        return started
+    }
+
+    private func handle(_ value: IOHIDValue) {
+        let element = IOHIDValueGetElement(value)
+        guard IOHIDElementGetUsagePage(element) == kHIDPage_KeyboardOrKeypad else { return }
+        let key: CGKeyCode
+        switch IOHIDElementGetUsage(element) {
+        case 0xE0: key = 59  // 左 Ctrl
+        case 0xE4: key = 62  // 右 Ctrl
+        default: return
+        }
+        if IOHIDValueGetIntegerValue(value) != 0 { down.insert(key) } else { down.remove(key) }
+    }
+
+    func isDown(_ key: CGKeyCode) -> Bool { down.contains(key) }
+    var pressed: [CGKeyCode] { down.sorted() }
+}
+
+private func holdKeyDown(_ keys: [CGKeyCode], hid: HIDKeyMonitor?) -> Bool {
+    keys.contains { key in
+        if let hid, hid.started, hid.isDown(key) { return true }
+        return CGEventSource.keyState(.hidSystemState, key: key)
+    }
+}
+
+private let supportedCaptureBundles: Set<String> = [
+    "com.tencent.inputmethod.wetype", "com.bytedance.inputmethod.doubaoime"
+]
+
+private struct CaptureSnapshot {
+    var available: Bool
+    var bundles: [String] = []
+    var problem = ""
+    var capturing: Bool { available && !bundles.isEmpty }
+    var summary: String {
+        "captureAvailable=\(available) captureBundles=\(bundles)" + (problem.isEmpty ? "" : " captureError=\(problem)")
+    }
+
+    static func select(_ processes: [(String, UInt32?)]) -> CaptureSnapshot {
+        let supported = processes.filter { supportedCaptureBundles.contains($0.0) }
+        let active = supported.filter { ($0.1 ?? 0) != 0 }.map { $0.0 }
+        return CaptureSnapshot(available: !supported.contains { $0.1 == nil }, bundles: Array(Set(active)).sorted(),
+                               problem: supported.contains { $0.1 == nil } ? "piri-read-failed" : "")
+    }
+}
+
+private func captureSnapshot() -> CaptureSnapshot {
+    func address(_ selector: UInt32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    }
+    var listAddress = address(0x70727323) // prs#
+    let system = AudioObjectID(kAudioObjectSystemObject)
     var size: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(object, &addr, 0, nil, &size) == noErr else { return nil }
-    var unmanaged: Unmanaged<CFString>?
-    var sz = size
-    let status = AudioObjectGetPropertyData(object, &addr, 0, nil, &sz, &unmanaged)
-    guard status == noErr, let unmanaged else { return nil }
-    return unmanaged.takeUnretainedValue() as String
+    let sizeResult = AudioObjectGetPropertyDataSize(system, &listAddress, 0, nil, &size)
+    guard sizeResult == noErr else { return CaptureSnapshot(available: false, problem: "prs#-size:\(sizeResult)") }
+    guard size > 0 else { return CaptureSnapshot(available: true) }
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    let listResult = AudioObjectGetPropertyData(system, &listAddress, 0, nil, &size, &ids)
+    guard listResult == noErr else { return CaptureSnapshot(available: false, problem: "prs#-read:\(listResult)") }
+    var processes: [(String, UInt32?)] = []
+    for id in ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size) {
+        var bundleAddress = address(0x70626964) // pbid
+        var bundle: Unmanaged<CFString>?
+        var bundleSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let result = AudioObjectGetPropertyData(id, &bundleAddress, 0, nil, &bundleSize, &bundle)
+        guard result == noErr, let bundle else {
+            return CaptureSnapshot(available: false, problem: "pbid-read:\(result)")
+        }
+        let name = bundle.takeUnretainedValue() as String
+        guard supportedCaptureBundles.contains(name) else { continue }
+        var inputAddress = address(0x70697269) // piri
+        var input: UInt32 = 0
+        var inputSize = UInt32(MemoryLayout<UInt32>.size)
+        let inputResult = AudioObjectGetPropertyData(id, &inputAddress, 0, nil, &inputSize, &input)
+        processes.append((name, inputResult == noErr ? input : nil))
+    }
+    return CaptureSnapshot.select(processes)
 }
 
-private func processObjectIDs() -> [AudioObjectID] {
-    var addr = AudioObjectPropertyAddress(
-        mSelector: kProcessObjectList,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    let sys = AudioObjectID(kAudioObjectSystemObject)
-    var size: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr else { return [] }
-    let count = Int(size) / MemoryLayout<AudioObjectID>.size
-    var ids = [AudioObjectID](repeating: 0, count: count)
-    var sz = size
-    guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &sz, &ids) == noErr else { return [] }
-    return ids
+private func recognitionMode(hidStarted: Bool) -> String { hidStarted ? "precise-key" : "degraded-cg-or-ime-capture" }
+
+private func triggerHeld(keyDown: Bool, hidStarted: Bool, capture: CaptureSnapshot) -> Bool {
+    keyDown || (!hidStarted && capture.capturing)
 }
 
-private func activeInputMethodCaptureReason() -> String? {
-    for id in processObjectIDs() {
-        let bundleID = audioString(id, kProcessBundleID) ?? ""
-        guard let reason = captureReasonsByBundleID[bundleID] else { continue }
-        if (audioUInt32(id, kProcessIsRunningInput) ?? 0) != 0 {
-            return reason
+// Only one HAL query can be in flight; results and all controller state belong to main.
+private final class CaptureMonitor {
+    private let queue = DispatchQueue(label: "com.doubao.audio-duck.capture")
+    private var inFlight = false
+    private var lastQuery: UInt64 = 0
+    private var lastSummary = ""
+    private(set) var snapshot = CaptureSnapshot(available: false, problem: "not-sampled")
+
+    func poll() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard !inFlight, now - lastQuery >= 20_000_000 else { return }
+        lastQuery = now; inFlight = true
+        queue.async {
+            let result = captureSnapshot()
+            DispatchQueue.main.async {
+                self.inFlight = false
+                self.snapshot = result
+                if result.summary != self.lastSummary {
+                    self.lastSummary = result.summary
+                    log("\(result.available ? "fallback capture" : "ERROR fallback capture unavailable; swallowed hold key cannot be detected:") \(result.summary)")
+                }
+            }
         }
     }
-    return nil
 }
 
-private func inputMethodHALCapturing(bundleID: String) -> Bool {
-    for id in processObjectIDs() {
-        guard audioString(id, kProcessBundleID) == bundleID else { continue }
-        if (audioUInt32(id, kProcessIsRunningInput) ?? 0) != 0 {
-            return true
-        }
-    }
-    return false
-}
-
-/// Display geometry straight from CoreGraphics. It shares the top-left global
-/// coordinate space with CGWindow bounds (so no vertical flip is needed) and,
-/// unlike NSScreen, it is safe to call off the main thread — which matters
-/// because the overlay scan now runs on the input queue.
-private func displayBounds() -> [CGRect] {
-    var count: UInt32 = 0
-    guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else {
-        return [CGRect(x: 0, y: 0, width: 1920, height: 1080)]
-    }
-    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
-    guard CGGetActiveDisplayList(count, &ids, &count) == .success else {
-        return [CGRect(x: 0, y: 0, width: 1920, height: 1080)]
-    }
-    return ids.map { CGDisplayBounds($0) }
-}
-
-/// CGWindow bounds are top-left origin, the same space as CGDisplayBounds.
-private func cgWindowRect(_ bounds: [String: Any]) -> CGRect {
-    let x = (bounds["X"] as? NSNumber)?.doubleValue ?? 0
-    let y = (bounds["Y"] as? NSNumber)?.doubleValue ?? 0
-    let w = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
-    let h = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
-    return CGRect(x: x, y: y, width: w, height: h)
-}
-
-private func windowVisibleOnAScreen(_ cgRect: CGRect) -> Bool {
-    for screen in displayBounds() {
-        let inter = screen.intersection(cgRect)
-        // Parked-off-the-edge panels can share 0–2px with the display. Require a real visible chunk.
-        if !inter.isNull && inter.width >= 80 && inter.height >= 30 {
-            return true
-        }
-    }
-    return false
-}
-
-/// Doubao parks the idle voice bar flush against a display's right edge
-/// (x ≈ screenMaxX − width), not past it. On a 2560-wide panel that is
-/// around x=1917 and looks fully on-screen, which used to false-trigger ducking.
-private func overlayParkedAgainstRightEdge(_ cgRect: CGRect) -> Bool {
-    for screen in displayBounds() {
-        let maxX = screen.maxX
-        let minX = screen.minX
-        let flush = maxX - cgRect.width
-        if abs(cgRect.origin.x - flush) <= 48 { return true }
-        if cgRect.origin.x >= maxX - 24 { return true }
-        if cgRect.maxX <= minX + 24 { return true }
-    }
-    return false
-}
-
-/// Doubao's voice overlay uses a very high window layer; the typing candidate bar does not.
-/// Idle, that overlay sits flush with a screen's right edge — that is not recording.
-private func doubaoRecordingOverlayVisible() -> (Bool, String) {
-    guard let info = CGWindowListCopyWindowInfo(
-        [.optionAll, .excludeDesktopElements],
-        kCGNullWindowID
-    ) as? [[String: Any]] else { return (false, "") }
-
-    for win in info {
-        let owner = win[kCGWindowOwnerName as String] as? String ?? ""
-        guard owner.contains("豆包输入法") || owner.lowercased().contains("doubaoime") else { continue }
-        let onscreen = (win[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
-        guard onscreen else { continue }
-        let layer = win[kCGWindowLayer as String] as? Int ?? 0
-        let bounds = win[kCGWindowBounds as String] as? [String: Any] ?? [:]
-        let rect = cgWindowRect(bounds)
-        guard layer >= 100 && rect.width >= 180 && rect.height >= 40 else { continue }
-        if overlayParkedAgainstRightEdge(rect) { continue }
-        if windowVisibleOnAScreen(rect) {
-            return (true, "layer=\(layer) \(Int(rect.width))x\(Int(rect.height)) @\(Int(rect.origin.x)),\(Int(rect.origin.y))")
-        }
-    }
-    return (false, "")
-}
-
-private func currentInputSourceIsDoubao() -> Bool {
-    guard let src = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return false }
-    guard let raw = TISGetInputSourceProperty(src, kTISPropertyBundleID) else { return false }
-    let bid = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
-    return bid == doubaoBundleID
-}
-
-private func monotonicNanoseconds() -> UInt64 {
-    DispatchTime.now().uptimeNanoseconds
-}
-
-private func durationMilliseconds(_ nanoseconds: UInt64) -> Int {
-    Int(nanoseconds / 1_000_000)
-}
-
-private struct FnHoldGate {
-    enum Event {
-        case pressed(generation: UInt64)
-        case released(generation: UInt64, durationNanoseconds: UInt64)
-    }
-
-    let thresholdNanoseconds: UInt64
-    private(set) var held = false
-    private(set) var generation: UInt64 = 0
-    private var pressedAt: UInt64?
-
-    init(thresholdNanoseconds: UInt64) {
-        self.thresholdNanoseconds = thresholdNanoseconds
-        self.pressedAt = nil
-    }
-
-    mutating func update(held: Bool, at now: UInt64) -> Event? {
-        guard held != self.held else { return nil }
-        self.held = held
-        generation &+= 1
-        if held {
-            pressedAt = now
-            return .pressed(generation: generation)
-        }
-
-        let duration = pressedAt.map { now >= $0 ? now - $0 : 0 } ?? 0
-        pressedAt = nil
-        return .released(generation: generation, durationNanoseconds: duration)
-    }
-
-    func shouldArm(generation: UInt64, at now: UInt64) -> Bool {
-        guard held, self.generation == generation, let pressedAt else { return false }
-        return now >= pressedAt && now - pressedAt >= thresholdNanoseconds
-    }
-}
-
-/// Test hook: `DUCK_FAKE_FN_AT=<unix seconds>` makes the daemon report Fn as
-/// held for 1.5s starting at that wall-clock second. It exists so the arm
-/// latency can be measured inside a real launchd job, where timers behave very
-/// differently from an interactive shell, without touching the keyboard.
-/// Off unless the variable is set.
-private let fakeFnAt: TimeInterval = {
-    if let s = ProcessInfo.processInfo.environment["DUCK_FAKE_FN_AT"],
-       let n = TimeInterval(s) { return n }
-    return 0
-}()
-
-private let fakeFnRepeat: Int = {
-    if let s = ProcessInfo.processInfo.environment["DUCK_FAKE_FN_REPEAT"],
-       let n = Int(s), n > 0 { return n }
-    return 1
-}()
-
-private func fakedFnHeld() -> Bool? {
-    guard fakeFnAt > 0 else { return nil }
-    let now = Date().timeIntervalSince1970
-    for i in 0..<fakeFnRepeat {
-        let start = fakeFnAt + Double(i) * 3.0
-        if now >= start && now < start + 1.5 { return true }
-    }
-    return nil
-}
-
-private func hardwareFnHeld() -> Bool {
-    if let faked = fakedFnHeld() { return faked }
-    return CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
+private func grantAccess() {
+    print("hidInputBefore=\(HIDKeyMonitor.accessDescription)")
+    print("hidInputAfter=\(HIDKeyMonitor.requestIfNeeded())")
+    let binary = NSHomeDirectory() + "/.local/bin/doubao-audio-duck"
+    print("系统设置 → 隐私与安全性 → 输入监控：打开开关；如未列出，用 + 添加：\(binary)")
+    print("终端请求与 LaunchAgent 的权限归属可能不同；请求返回值不代表 daemon 已获授权。")
+    let opener = Process()
+    opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    opener.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"]
+    do { try opener.run(); opener.waitUntilExit(); print("settingsOpenExit=\(opener.terminationStatus)") }
+    catch { print("无法自动打开系统设置：\(error)") }
+    print("授权后重启：launchctl kickstart -k gui/$(id -u)/com.doubao.audio-duck")
 }
 
 private final class DuckController {
-    /// All capture transitions and restore decisions are serialized here.
-    let queue = DispatchQueue(label: "com.doubao.audio-duck.input", qos: .userInteractive)
-
-    /// Core Audio probing runs separately; no window enumeration is needed.
-    private let scanQueue = DispatchQueue(label: "com.doubao.audio-duck.scan", qos: .userInitiated)
-    private var scanInFlight = false
-
-    private var lastHidHeld: Bool?
     private let readMute: () -> Bool?
     private let writeMute: (Bool) -> Bool
     private let publishStatus: (String) -> Void
+    private var mutedBefore: Bool?
+    private var requestedMute: Bool?
+    private var lastStatus: String?
+    private var lastProblem: String?
+    private var lastProblemAt: UInt64 = 0
+    private(set) var keyHeld = false
+    var needsRestore: Bool { mutedBefore == false }
 
     init(readMute: @escaping () -> Bool? = systemMuteState,
          writeMute: @escaping (Bool) -> Bool = setSystemMuted,
          publishStatus: @escaping (String) -> Void = writeStatus) {
-        self.readMute = readMute
-        self.writeMute = writeMute
-        self.publishStatus = publishStatus
+        self.readMute = readMute; self.writeMute = writeMute; self.publishStatus = publishStatus
     }
 
-    static func captureRegressionTests() -> [String] {
-        var muted = false
-        var writes: [Bool] = []
-        var statuses: [String] = []
-        let controller = DuckController(readMute: { muted }, writeMute: {
-            muted = $0; writes.append($0); return true
-        }, publishStatus: { statuses.append($0) })
-        var failures: [String] = []
-        controller.queue.sync {
-            // Replay capture without an Fn edge. The first sample must mute.
-            controller.applySustainSample(captureReason: "doubao-capture")
-            if !muted { failures.append("Doubao capture without Fn did not mute immediately") }
-            if statuses.last != "ducked doubao-capture" { failures.append("Doubao capture published the wrong status") }
-            controller.applySustainSample(captureReason: "doubao-capture")
-            if writes != [true] { failures.append("active capture must mute exactly once") }
-            controller.applySustainSample(captureReason: nil)
-            if !muted { failures.append("audio restored before release grace period") }
-            controller.restoreWork?.cancel()
-            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
-            if muted { failures.append("capture stop did not restore audio") }
-            controller.applySustainSample(captureReason: nil)
-            if muted { failures.append("idle sample incorrectly muted audio") }
-            controller.restoreWork?.cancel()
-        }
-        muted = false
-        writes = []
-        statuses = []
-        controller.queue.sync {
-            controller.applySustainSample(captureReason: "wetype-capture")
-            if !muted { failures.append("WeType capture did not mute immediately") }
-            if statuses.last != "ducked wetype-capture" { failures.append("WeType capture published the wrong status") }
-            controller.applySustainSample(captureReason: nil)
-            controller.restoreWork?.cancel()
-            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
-            if muted { failures.append("WeType capture stop did not restore audio") }
-        }
-        muted = true
-        writes = []
-        controller.queue.sync {
-            controller.applySustainSample(captureReason: "doubao-capture")
-            controller.applySustainSample(captureReason: nil)
-            controller.restoreWork?.cancel()
-            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
-            if !muted || !writes.isEmpty { failures.append("pre-existing mute was changed") }
-        }
-        muted = false
-        controller.queue.sync {
-            controller.applySustainSample(captureReason: "doubao-capture")
-            controller.applySustainSample(captureReason: nil)
-            let stale = controller.captureGeneration
-            controller.restoreWork?.cancel()
-            controller.applySustainSample(captureReason: "wetype-capture")
-            controller.applySustainSample(captureReason: nil)
-            controller.restoreWork?.cancel()
-            controller.restoreIfStillIdle(generation: stale, reason: "self-test-stale")
-            if !muted { failures.append("stale restore unmuted a new recording") }
-            controller.restoreIfStillIdle(generation: controller.captureGeneration, reason: "self-test")
-            if muted { failures.append("new recording did not restore") }
-        }
-        return failures
+    private func status(_ value: String) {
+        guard value != lastStatus else { return }
+        lastStatus = value
+        publishStatus(value)
     }
 
-    /// Legacy Fn path retained for diagnosis; runDaemon no longer calls it.
-    /// Returns true while the tool is "hot" (Fn held or audio ducked) so the
-    /// caller can poll faster.
-    func pollInput() -> Bool {
-        let held = hardwareFnHeld()
-        if held != lastHidHeld {
-            lastHidHeld = held
-            handleFnChanged(held, source: "hid-state")
-        }
-        pollFn()
-        return fnGate.held || duckedByUs
-    }
-
-    /// Conservative mode, kept for hardware that reports phantom Fn flags.
-    /// Setting DUCK_FN_HOLD_MS restores the old "wait, then mute" behaviour.
-    ///
-    /// It is off by default because the wait is exactly the bug: Doubao starts
-    /// capturing on Fn-down, so every millisecond spent waiting is playback
-    /// that gets recognised.
-    static let legacyHoldMilliseconds: Int? = {
-        if let s = ProcessInfo.processInfo.environment["DUCK_FN_HOLD_MS"],
-           let n = Int(s), (100...2_000).contains(n) {
-            return n
-        }
-        return nil
-    }()
-
-    /// Fast mode: Fn must be down this long, measured from the real Fn-down
-    /// event, before we mute. Two 20ms polls of hidSystemState must agree,
-    /// which filters a one-tick phantom report without re-introducing the
-    /// audible leak. Override with DUCK_FN_CONFIRM_MS.
-    static let fnConfirmMilliseconds: Int = {
-        if let s = ProcessInfo.processInfo.environment["DUCK_FN_CONFIRM_MS"],
-           let n = Int(s), (0...400).contains(n) {
-            return n
-        }
-        return 40
-    }()
-
-    /// Reported by --dump / --self-test and written to the log at startup.
-    static var fnHoldMilliseconds: Int {
-        legacyHoldMilliseconds ?? fnConfirmMilliseconds
-    }
-
-    static var modeDescription: String { "ime-capture" }
-
-    private static let fnArmNanoseconds = UInt64(fnConfirmMilliseconds) * 1_000_000
-    /// Gate threshold — only the conservative legacy path still consults it.
-    private static let fnHoldNanoseconds = UInt64(fnHoldMilliseconds) * 1_000_000
-    /// A hold shorter than this that never produced HAL capture or the
-    /// recording overlay was a phantom Fn flag; restore fast instead of
-    /// waiting the full second.
-    private static let shortHoldNanoseconds: UInt64 = 400_000_000
-    private static let fastRestoreDelay: TimeInterval = 0.15
-    private static let standardRestoreDelay: TimeInterval = 1.0
-
-    private var duckedByUs = false
-    private var mutedBefore = false
-    private var fnGate = FnHoldGate(thresholdNanoseconds: DuckController.fnHoldNanoseconds)
-    private var holdWork: DispatchWorkItem?
-    private var restoreWork: DispatchWorkItem?
-    private let sustainStableNanoseconds: UInt64 = 320_000_000
-    private var overlayStartedAt: UInt64?
-    private var halStartedAt: UInt64?
-    private var overlayInfo = ""
-    private var sustainActive = false
-    private var captureGeneration: UInt64 = 0
-    /// Short Fn taps never cross the arm threshold. Keep a window so the
-    /// recording overlay / HAL capture that follows a click can start the duck.
-    private var fnCorroborationDeadline: UInt64 = 0
-    private static let fnCorroborationNanoseconds: UInt64 = 1_200_000_000
-    /// Fast-mode bookkeeping.
-    private var fnPressedAt: UInt64 = 0
-    private var duckStartedByFn = false
-    private var sawRecordingEvidence = false
-    /// Cached result of the IME check. See the note in handleFnChanged.
-    private var inputSourceIsDoubao = false
-    private var lastInputSourceRefresh: UInt64 = 0
-
-    /// Last-resort restore used on SIGTERM/SIGINT so a killed daemon
-    /// never leaves the system muted. Runs before exit.
-    func emergencyRestore(_ why: String) {
-        queue.sync {
-            holdWork?.cancel()
-            restoreWork?.cancel()
-            if duckedByUs && !mutedBefore {
-                _ = setSystemMuted(false)
-            }
-            writeStatus("idle")
-            log("emergency restore (\(why)) duckedByUs=\(duckedByUs) mutedBefore=\(mutedBefore)")
-        }
-        exit(0)
-    }
-
-    func handleFnChanged(_ held: Bool, source: String) {
-        let now = monotonicNanoseconds()
-        guard let event = fnGate.update(held: held, at: now) else { return }
-
-        holdWork?.cancel()
-        holdWork = nil
-
-        switch event {
-        case .pressed(let generation):
-            // A re-press cancels a pending restore immediately, rather than
-            // waiting for the new hold to cross the start threshold.
-            restoreWork?.cancel()
-            restoreWork = nil
-            fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
-            fnPressedAt = now
-            sawRecordingEvidence = false
-            // Query the IME here, not at mute time. The first query in a process
-            // builds an XPC connection to the text-input subsystem and costs
-            // ~33ms (measured); at press time that is hidden inside the confirm
-            // window, whereas in front of the mute it was pure added latency.
-            inputSourceIsDoubao = currentInputSourceIsDoubao()
-            lastInputSourceRefresh = now
-            log("Fn down source=\(source) generation=\(generation)")
-
-            // Conservative path: mute only after the configured hold. pollFn()
-            // is a no-op in this mode.
-            if let holdMilliseconds = Self.legacyHoldMilliseconds {
-                guard !duckedByUs else { return }
-                let work = DispatchWorkItem { [weak self] in
-                    self?.armFn(generation: generation)
-                }
-                holdWork = work
-                DispatchQueue.main.asyncAfter(
-                    deadline: .now() + .milliseconds(holdMilliseconds),
-                    execute: work
-                )
-            }
-
-        case .released(let generation, let durationNanoseconds):
-            fnCorroborationDeadline = now + Self.fnCorroborationNanoseconds
-            fnPressedAt = 0
-            log("Fn up source=\(source) generation=\(generation) durationMs=\(durationMilliseconds(durationNanoseconds))")
-            if duckedByUs {
-                // A short hold that never produced HAL capture or the recording
-                // overlay was a shortcut chord (Fn+Delete, Fn+brightness) or a
-                // phantom Fn flag. Unmute quickly so the dip stays inaudible.
-                if duckStartedByFn, !sawRecordingEvidence,
-                   durationNanoseconds < Self.shortHoldNanoseconds {
-                    scheduleRestoreIfIdle(reason: "fn-shortcut", delay: Self.fastRestoreDelay)
-                } else {
-                    scheduleRestoreIfIdle(reason: "fn-up", delay: Self.standardRestoreDelay)
-                }
-            }
+    private func problem(_ value: String) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if value != lastProblem || now - lastProblemAt >= 500_000_000 {
+            log(value); lastProblem = value; lastProblemAt = now
         }
     }
 
-    /// Fast-mode Fn handling, called every few milliseconds while the daemon is up.
-    ///
-    /// Mute as soon as Fn is confirmed. Do not undo based on `keyState`:
-    /// holding Fn/Globe makes macOS report other keys (F-keys, even arrows) as
-    /// down, which cancelled every real dictation. Terminal Fn+arrow will mute
-    /// for the hold; that is the trade-off the voice path needs.
-    func pollFn() {
-        guard Self.legacyHoldMilliseconds == nil, fnGate.held, !duckedByUs else { return }
-        let now = monotonicNanoseconds()
-
-        guard now >= fnPressedAt, now - fnPressedAt >= Self.fnArmNanoseconds else { return }
-        if !inputSourceIsDoubao {
-            // The user can switch to Doubao while Fn is already held. Re-check,
-            // but rate-limited: an unbuffered query must not run every 8ms.
-            if now - lastInputSourceRefresh >= 200_000_000 {
-                lastInputSourceRefresh = now
-                inputSourceIsDoubao = currentInputSourceIsDoubao()
-            }
-            guard inputSourceIsDoubao else { return }
+    // 写入与回读不同步时保留原始状态，绝不把自己的静音重新当成用户静音。
+    private func reconcile(muted: Bool) -> Bool {
+        if requestedMute == muted, readMute() == muted {
+            status(muted ? "ducked hold-key" : "idle")
+            lastProblem = nil
+            return true
         }
-
-        duckStartedByFn = true
-        applyDuck(true, reason: "fn-\(durationMilliseconds(now - fnPressedAt))ms")
-        if !duckedByUs {
-            duckStartedByFn = false
+        guard writeMute(muted) else {
+            status(muted ? "mute-pending" : "restore-pending")
+            problem("DUCK write failed targetMuted=\(muted); retaining restore responsibility")
+            return false
         }
+        requestedMute = muted
+        guard readMute() == muted else {
+            status(muted ? "mute-pending" : "restore-pending")
+            problem("DUCK readback pending targetMuted=\(muted) (write accepted); retaining restore responsibility")
+            return false
+        }
+        status(muted ? "ducked hold-key" : "idle")
+        lastProblem = nil
+        return true
     }
 
-    /// Sample supported input methods' capture state regardless of keyboard flags.
-    /// Window geometry and the shared Function flag are not recording evidence.
-    func requestSustainSample() {
-        guard !scanInFlight else { return }
-        scanInFlight = true
-        scanQueue.async { [weak self] in
-            guard let self else { return }
-            let captureReason = activeInputMethodCaptureReason()
-            self.queue.async {
-                self.scanInFlight = false
-                self.applySustainSample(captureReason: captureReason)
-            }
+    func update(held: Bool) {
+        if held != keyHeld {
+            keyHeld = held
+            log("hold key \(held ? "down" : "up")")
         }
-    }
-
-    /// Start on the first capture sample; debounce only the restore.
-    /// This intentionally also mutes background capture by a monitored input
-    /// method, since HAL cannot distinguish it from voice recognition.
-    private func applySustainSample(captureReason: String?) {
-        let capturing = captureReason != nil
-        if sustainActive != capturing { captureGeneration &+= 1 }
-        sustainActive = capturing
-        if let captureReason {
-            restoreWork?.cancel()
-            restoreWork = nil
-            applyDuck(true, reason: captureReason)
-        } else {
-            scheduleRestoreIfIdle(reason: "capture-ended", delay: Self.standardRestoreDelay)
-        }
-    }
-
-    private func armFn(generation: UInt64) {
-        holdWork = nil
-        let now = monotonicNanoseconds()
-        guard fnGate.shouldArm(generation: generation, at: now) else { return }
-
-        guard currentInputSourceIsDoubao() else {
-            log("Fn hold ignored generation=\(generation): current input source is not Doubao")
-            // The input source can change while Fn is held. Retry without
-            // counting callbacks as elapsed time, but never after release.
-            guard fnGate.held else { return }
-            let work = DispatchWorkItem { [weak self] in
-                self?.armFn(generation: generation)
-            }
-            holdWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100), execute: work)
-            return
-        }
-
-        duckStartedByFn = true
-        applyDuck(true, reason: "fn-\(DuckController.fnHoldMilliseconds)ms")
-    }
-
-    private func isStable(since: UInt64?, now: UInt64) -> Bool {
-        guard let since, now >= since else { return false }
-        return now - since >= sustainStableNanoseconds
-    }
-
-    private func scheduleRestoreIfIdle(reason: String, delay: TimeInterval) {
-        guard duckedByUs, !sustainActive, restoreWork == nil else { return }
-        let generation = captureGeneration
-        let work = DispatchWorkItem { [weak self] in
-            self?.restoreIfStillIdle(generation: generation, reason: reason)
-        }
-        restoreWork = work
-        log("restore scheduled reason=\(reason) generation=\(generation) delayMs=\(Int(delay * 1000))")
-        queue.asyncAfter(deadline: .now() + delay, execute: work)
-    }
-
-    private func restoreIfStillIdle(generation: UInt64, reason: String) {
-        restoreWork = nil
-        guard generation == captureGeneration, !sustainActive else {
-            log("restore skipped generation=\(generation) current=\(captureGeneration) sustain=\(sustainActive)")
-            return
-        }
-        applyDuck(false, reason: reason)
-    }
-
-    private func applyDuck(_ on: Bool, reason: String) {
-        if on {
-            if duckedByUs { return }
-            guard let before = readMute() else {
-                log("DUCK failed (\(reason)): cannot read output mute state")
-                return
-            }
-            mutedBefore = before
-            if !mutedBefore && !writeMute(true) { return }
-            duckedByUs = true
-            // Verify mute actually took effect
-            if let verify = readMute(), !verify {
-                log("DUCK verification FAILED: mute did not take effect")
-                duckedByUs = false
-                return
-            }
-            publishStatus("ducked \(reason)")
-            log("DUCK on (\(reason)) mutedBefore=\(mutedBefore)")
-        } else {
-            if !duckedByUs { return }
-            if !mutedBefore {
-                guard writeMute(false) else {
-                    log("DUCK restore failed (\(reason)); keeping ownership state")
+        if held {
+            if mutedBefore == nil {
+                guard let before = readMute() else {
+                    problem("DUCK cannot read initial mute state; retrying")
                     return
                 }
+                mutedBefore = before
+                log("DUCK begin mutedBefore=\(before)")
             }
-            duckedByUs = false
-            duckStartedByFn = false
-            publishStatus("idle")
-            log("DUCK off (\(reason)) restoredMuted=\(mutedBefore)")
+            if mutedBefore == true { status("held pre-muted"); return }
+            _ = reconcile(muted: true)
+        } else if let before = mutedBefore {
+            if before || reconcile(muted: false) {
+                mutedBefore = nil; requestedMute = nil
+                status("idle")
+                log("DUCK end restoredMuted=\(before)")
+            }
+        } else {
+            status("idle")
         }
+    }
+
+    func restoreBeforeExit() -> Bool {
+        for _ in 0..<100 {
+            update(held: false)
+            if !needsRestore { return true }
+            usleep(5_000)
+        }
+        log("emergency restore unconfirmed; output may still be muted")
+        return false
     }
 }
 
-private func combinedFnHeld() -> Bool {
-    CGEventSource.flagsState(.combinedSessionState).contains(.maskSecondaryFn)
+private var lockFD: Int32 = -1
+
+private func acquireSingletonLock() {
+    lockFD = open("/tmp/doubao-audio-duck.lock", O_CREAT | O_RDWR, 0o644)
+    guard lockFD >= 0 else { log("could not open lock file; exiting"); exit(1) }
+    if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+        if errno == EWOULDBLOCK { log("another instance holds the lock, exiting"); exit(0) }
+        log("could not acquire lock; exiting"); exit(1)
+    }
 }
 
-/// Keys people actually chord with Fn for navigation: arrows become
-/// Home/End/PageUp/PageDown, and Delete becomes forward-delete.
-///
-/// Do not put F1–F12 or IOKit NX_KEYTYPE media codes in this list.
-/// `CGEventSource.keyState` takes virtual key codes (`kVK_ANSI_*` /
-/// `kVK_F*`), not NX_KEYTYPE values. 14/16/17/18/21/22 are E/Y/T/1/4/6,
-/// and holding the Fn/Globe key itself makes F-keys look down — both of
-/// which unmuted every real dictation (~8 ms after DUCK on).
-private let companionKeyCodes: [CGKeyCode] = [
-    123, 124, 125, 126, // arrows
-    117, 51,            // forward delete, delete
-]
-
-/// hidSystemState flags only report modifiers, so Fn alone and Fn+Down look
-/// identical there. keyState exposes individual keys without an event tap.
-private func companionKeyDown() -> CGKeyCode? {
-    for code in companionKeyCodes {
-        if CGEventSource.keyState(.hidSystemState, key: code)
-            || CGEventSource.keyState(.combinedSessionState, key: code) {
-            return code
-        }
+private func runDaemon() {
+    acquireSingletonLock()
+    let shortcut = HoldShortcut.load()
+    let hid = HIDKeyMonitor()
+    let access = HIDKeyMonitor.requestIfNeeded()
+    let hidStarted = hid.start()
+    let mode = recognitionMode(hidStarted: hidStarted)
+    let channel = "hidInput=\(access) hidStarted=\(hidStarted) hidOpenResult=\(hid.openDescription) recognitionMode=\(mode)"
+    log("started pid=\(ProcessInfo.processInfo.processIdentifier) mode=\(modeDescription) \(channel)")
+    log("shortcut \(shortcut.summary) holdKeys=\(shortcut.keys) keyPollIntervalMs=5")
+    if !hidStarted {
+        log("ERROR 物理按键通道不可用，精确按键模式此刻无效；启用 CG 或输入法采麦降级。运行 ~/.local/bin/doubao-audio-duck --grant")
+        log("degraded capturePollIntervalMs=20; background pre-capture/click recording can mute until capture stops; release timing is approximate")
     }
-    return nil
+    let capture = CaptureMonitor()
+    var audioStatus = "idle"
+    var lastPublished = ""
+    func publish() {
+        let health = hidStarted ? "captureAvailable=not-used" : capture.snapshot.summary
+        let value = "\(audioStatus) pid=\(ProcessInfo.processInfo.processIdentifier) \(channel) \(health)"
+        if value != lastPublished { writeStatus(value); lastPublished = value }
+    }
+    let duck = DuckController(publishStatus: { audioStatus = $0; publish() })
+    publish()
+    let timer = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+    timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .nanoseconds(0))
+    timer.setEventHandler {
+        if !hidStarted { capture.poll() }
+        duck.update(held: triggerHeld(keyDown: holdKeyDown(shortcut.keys, hid: hid), hidStarted: hidStarted, capture: capture.snapshot))
+        publish()
+    }
+    signal(SIGTERM, SIG_IGN); signal(SIGINT, SIG_IGN)
+    let signals = [SIGTERM, SIGINT].map { sig in
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+        source.setEventHandler {
+            timer.cancel()
+            let restored = duck.restoreBeforeExit()
+            log("emergency restore signal=\(sig) confirmed=\(restored)")
+            exit(restored ? 0 : 1)
+        }
+        source.resume()
+        return source
+    }
+    timer.resume()
+    withExtendedLifetime((timer, signals, hid)) { RunLoop.main.run() }
 }
 
 private func runSelfTest() {
-    let threshold = UInt64(DuckController.fnHoldMilliseconds) * 1_000_000
-    var gate = FnHoldGate(thresholdNanoseconds: threshold)
-    var failures = DuckController.captureRegressionTests()
-
+    var failures: [String] = []
+    var assertions = 0
     func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
+        assertions += 1
         if !condition() { failures.append(message) }
     }
-
-    _ = gate.update(held: true, at: 0)
-    expect(!gate.shouldArm(generation: gate.generation, at: threshold - 1), "armed before hold threshold")
-    expect(gate.shouldArm(generation: gate.generation, at: threshold), "did not arm at hold threshold")
-
-    let firstGeneration = gate.generation
-    _ = gate.update(held: false, at: threshold + 50_000_000)
-    let newDownAt = threshold + 60_000_000
-    _ = gate.update(held: true, at: newDownAt)
-    expect(gate.generation != firstGeneration, "release/re-press did not create a new generation")
-    expect(!gate.shouldArm(generation: firstGeneration, at: threshold * 3), "stale generation could arm after re-press")
-    expect(!gate.shouldArm(generation: gate.generation, at: newDownAt + threshold / 2), "rapid re-press armed too early")
-    expect(gate.shouldArm(generation: gate.generation, at: newDownAt + threshold), "new hold did not arm after its own duration")
-
-    let companions = Set(companionKeyCodes)
-    expect(companions == Set([123, 124, 125, 126, 117, 51] as [CGKeyCode]), "companion list must stay arrows+delete")
-    for nxKeyTypeCollidingWithANSI in [14, 16, 17, 18, 21, 22] as [CGKeyCode] {
-        expect(!companions.contains(nxKeyTypeCollidingWithANSI), "NX_KEYTYPE \(nxKeyTypeCollidingWithANSI) collided with an ANSI key")
+    final class FakeAudio {
+        var muted = false
+        var reads: [Bool?] = []
+        var writes: [Bool] = []
+        var failuresRemaining = 0
+        func read() -> Bool? { reads.isEmpty ? muted : reads.removeFirst() }
+        func write(_ value: Bool) -> Bool {
+            writes.append(value)
+            if failuresRemaining > 0 { failuresRemaining -= 1; return false }
+            muted = value; return true
+        }
+        func controller() -> DuckController {
+            DuckController(readMute: { self.read() }, writeMute: { self.write($0) }, publishStatus: { _ in })
+        }
     }
-    for functionKey in [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111] as [CGKeyCode] {
-        expect(!companions.contains(functionKey), "F-key \(functionKey) must not count as an Fn chord")
+    do {
+        let audio = FakeAudio(), duck = audio.controller()
+        duck.update(held: false)
+        expect(audio.writes.isEmpty, "idle changed audio")
+        duck.update(held: true); duck.update(held: true)
+        expect(audio.muted && audio.writes == [true], "hold did not mute exactly once")
+        duck.update(held: false); duck.update(held: false)
+        expect(!audio.muted && audio.writes == [true, false] && !duck.needsRestore, "release did not restore")
     }
-
+    do {
+        let audio = FakeAudio(); audio.muted = true
+        let duck = audio.controller()
+        duck.update(held: true); duck.update(held: true); duck.update(held: false)
+        expect(audio.muted && audio.writes.isEmpty, "pre-existing user mute changed")
+    }
+    do {
+        let audio = FakeAudio(); audio.reads = [false, false]
+        let duck = audio.controller()
+        duck.update(held: true)
+        expect(duck.needsRestore, "stale mute readback discarded restore responsibility")
+        duck.update(held: true); duck.update(held: false)
+        expect(!audio.muted && audio.writes == [true, false], "stale mute readback prevented restoration")
+    }
+    do {
+        let audio = FakeAudio(); audio.reads = [false, nil]
+        let duck = audio.controller()
+        duck.update(held: true); duck.update(held: false)
+        expect(!audio.muted && !duck.needsRestore, "unknown mute readback prevented restoration")
+    }
+    do {
+        let audio = FakeAudio(), duck = audio.controller()
+        duck.update(held: true); audio.failuresRemaining = 1
+        duck.update(held: false)
+        expect(duck.needsRestore && audio.muted, "failed restoration discarded responsibility")
+        duck.update(held: false)
+        expect(!audio.muted && !duck.needsRestore && audio.writes == [true, false, false], "restoration was not retried")
+    }
+    do {
+        let audio = FakeAudio(), duck = audio.controller()
+        duck.update(held: true); audio.reads = [true, nil]
+        duck.update(held: false)
+        expect(duck.needsRestore, "stale restoration readback discarded responsibility")
+        duck.update(held: false)
+        expect(!audio.muted && !duck.needsRestore, "unknown restoration readback was not retried")
+    }
+    do {
+        let audio = FakeAudio(), duck = audio.controller()
+        duck.update(held: true); audio.reads = [true]
+        duck.update(held: false); duck.update(held: true)
+        expect(audio.muted && duck.needsRestore && audio.writes == [true, false, true], "re-press did not cancel pending restoration")
+        duck.update(held: false)
+        expect(!audio.muted && !duck.needsRestore, "re-press lost original unmuted state")
+    }
+    do {
+        let audio = FakeAudio(); audio.failuresRemaining = 1
+        let duck = audio.controller()
+        duck.update(held: true); duck.update(held: true); duck.update(held: false)
+        expect(!audio.muted && audio.writes == [true, true, false], "failed mute was not retried")
+    }
+    do {
+        let audio = FakeAudio(); audio.reads = [nil, false]
+        let duck = audio.controller()
+        duck.update(held: true)
+        expect(audio.writes.isEmpty, "unknown initial state was overwritten")
+        duck.update(held: true)
+        expect(audio.muted, "initial read failure was not retried")
+        expect(duck.restoreBeforeExit() && !audio.muted, "signal-equivalent cleanup did not restore")
+    }
+    func varint(_ value: UInt64) -> [UInt8] {
+        var value = value, bytes: [UInt8] = []
+        repeat {
+            let byte = UInt8(value & 0x7f); value >>= 7
+            bytes.append(byte | (value == 0 ? 0 : 0x80))
+        } while value != 0
+        return bytes
+    }
+    func stringValue(_ value: String) -> [UInt8] { varint(UInt64(value.utf8.count)) + value.utf8 }
+    func fixture(_ extra: [(String, [UInt8])] = []) -> Data {
+        let entries: [(String, [UInt8])] = [
+            ("voicePTTHotKey", [1]), ("voicePTTShortcut_keyCodes", stringValue("[62]")),
+            ("voicePTTShortcut_modifiers", varint(4096)), ("voicePTTShortcut_tapCount", [1])
+        ] + extra
+        var payload: [UInt8] = [0xff, 0xff, 0xff, 0x07]
+        for (key, value) in entries {
+            payload += varint(UInt64(key.utf8.count)) + key.utf8 + varint(UInt64(value.count)) + value
+        }
+        let count = UInt32(payload.count)
+        return Data((0..<4).map { UInt8(truncatingIfNeeded: count >> ($0 * 8)) } + payload + [0xff, 0xff])
+    }
+    let config = HoldShortcut.decode(fixture())
+    expect(config.key == 62 && config.source == "wetype" && config.modifiers == 4096, "right Ctrl configuration was not decoded")
+    expect(config.keys == [59, 62], "Control shortcut should watch both Ctrl sides")
+    let changed = HoldShortcut.decode(fixture([
+        ("voicePTTShortcut_keyCodes", stringValue("[61]")), ("voicePTTShortcut_modifiers", varint(2048))
+    ]))
+    expect(changed.key == 61 && changed.source == "wetype", "latest appended shortcut did not win")
+    let normal = HoldShortcut.decode(fixture([
+        ("voicePTTShortcut_keyCodes", stringValue("[49]")), ("voicePTTShortcut_modifiers", [0])
+    ]))
+    expect(normal.key == 49 && normal.source == "wetype", "unmodified single key was rejected")
+    expect(normal.keys == [49], "plain shortcut should watch only its key")
+    for (name, extra) in [
+        ("disabled", [("voicePTTHotKey", [UInt8(0)])]),
+        ("deleted", [("voicePTTHotKey", [])]),
+        ("chord", [("voicePTTShortcut_keyCodes", stringValue("[62,49]"))]),
+        ("modifiers", [("voicePTTShortcut_modifiers", varint(256))]),
+        ("multiple taps", [("voicePTTShortcut_tapCount", [UInt8(2)])]),
+        ("string length", [("voicePTTShortcut_keyCodes", [UInt8(10), 91, 54, 50, 93])]),
+        ("varint overflow", [("voicePTTShortcut_modifiers", Array(repeating: UInt8(255), count: 10))])
+    ] {
+        let value = HoldShortcut.decode(fixture(extra))
+        expect(value.key == 62 && value.source == "fallback" && !value.reason.isEmpty, "invalid \(name) did not fall back")
+    }
+    var truncated = fixture(); truncated.removeLast(3)
+    expect(HoldShortcut.decode(truncated).source == "fallback", "truncated MMKV payload was accepted")
+    expect(HoldShortcut.decode(Data([0xff, 0xff, 0xff, 0xff, 0])).source == "fallback", "oversized MMKV payload was accepted")
+    expect(HoldShortcut.decode(Data()).source == "fallback", "missing MMKV file did not fall back")
+    expect(HIDKeyMonitor.describeAccess(kIOHIDAccessTypeGranted) == "granted", "granted access mislabeled")
+    expect(HIDKeyMonitor.describeAccess(kIOHIDAccessTypeDenied) == "denied", "denied access mislabeled")
+    expect(HIDKeyMonitor.describeAccess(kIOHIDAccessTypeUnknown) == "unknown", "unknown access mislabeled")
+    let idleCapture = CaptureSnapshot.select([])
+    let wetypeCapture = CaptureSnapshot.select([("com.tencent.inputmethod.wetype", 1)])
+    let doubaoCapture = CaptureSnapshot.select([("com.bytedance.inputmethod.doubaoime", 1)])
+    let unknownCapture = CaptureSnapshot.select([("com.tencent.inputmethod.wetype", nil)])
+    expect(idleCapture.available && !idleCapture.capturing, "empty process list is not healthy idle")
+    expect(wetypeCapture.capturing && doubaoCapture.capturing, "supported input method capture was ignored")
+    expect(!CaptureSnapshot.select([("com.other.recorder", 1)]).capturing, "unrelated bundle triggered fallback")
+    expect(!unknownCapture.available && !unknownCapture.capturing && !unknownCapture.problem.isEmpty, "unknown query became healthy idle")
+    expect(!CaptureSnapshot(available: false, problem: "list-failed").available, "list failure became available")
+    expect(recognitionMode(hidStarted: true) == "precise-key" && recognitionMode(hidStarted: false) == "degraded-cg-or-ime-capture", "recognition mode selection failed")
+    expect(!triggerHeld(keyDown: false, hidStarted: true, capture: wetypeCapture), "capture affected precise key mode")
+    expect(triggerHeld(keyDown: true, hidStarted: false, capture: unknownCapture), "CG key fallback was blocked by capture error")
+    do {
+        let audio = FakeAudio(), duck = audio.controller()
+        duck.update(held: triggerHeld(keyDown: false, hidStarted: false, capture: wetypeCapture))
+        expect(audio.muted && duck.needsRestore, "capture start did not mute with restoration ownership")
+        duck.update(held: triggerHeld(keyDown: false, hidStarted: false, capture: idleCapture))
+        expect(!audio.muted && !duck.needsRestore, "capture stop did not restore")
+        duck.update(held: triggerHeld(keyDown: false, hidStarted: false, capture: unknownCapture))
+        expect(audio.writes == [true, false], "unknown capture unexpectedly muted")
+    }
     if failures.isEmpty {
-        print("self-test passed mode=\(DuckController.modeDescription)")
+        print("self-test passed: \(assertions) assertions (hold, ownership, MMKV, permissions, capture fallback)")
     } else {
         for failure in failures { print("self-test failed: \(failure)") }
         exit(1)
@@ -761,165 +681,64 @@ private func runSelfTest() {
 }
 
 private func dumpDebug() {
-    if let muted = systemMuteState() {
-        print("systemMuted=\(muted)")
-    } else {
-        print("systemMuted=unknown")
-    }
-    print("doubaoHALCapturing=\(inputMethodHALCapturing(bundleID: doubaoBundleID))")
-    print("wetypeHALCapturing=\(inputMethodHALCapturing(bundleID: weTypeBundleID))")
-    let overlay = doubaoRecordingOverlayVisible()
-    print("doubaoRecordingOverlayVisible=\(overlay.0) \(overlay.1)")
-    print("(recording overlay ignores bars parked flush with a screen's right edge)")
-    print("currentInputSourceIsDoubao=\(currentInputSourceIsDoubao())")
-    print("fnHeld=\(hardwareFnHeld()) hidSystemState")
-    print("fnHeldCombined=\(combinedFnHeld())")
-    print("duckMode=\(DuckController.modeDescription)")
-    print("capturePollIntervalMs=20")
-    if let code = companionKeyDown() {
-        print("companionKeyDown=\(code)")
-    } else {
-        print("companionKeyDown=false")
-    }
-    print("process objects:")
-    for id in processObjectIDs() {
-        let bid = audioString(id, kProcessBundleID) ?? "?"
-        let pid = audioUInt32(id, kProcessPID) ?? 0
-        let inn = audioUInt32(id, kProcessIsRunningInput) ?? 99
-        if inn != 0 || bid.contains("doubao") || bid.contains("wetype") || bid.contains("CoreSpeech") {
-            print("  pid=\(pid) in=\(inn) \(bid)")
-        }
-    }
-    if let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] {
-        print("on-screen Doubao windows:")
-        for win in info {
-            let owner = win[kCGWindowOwnerName as String] as? String ?? ""
-            if owner.contains("豆包") || owner.lowercased().contains("doubao") {
-                print("  owner=\(owner) layer=\(win[kCGWindowLayer as String] ?? 0) bounds=\(win[kCGWindowBounds as String] ?? [:])")
-            }
-        }
-    }
-}
-
-private var lockFD: Int32 = -1
-
-private func acquireSingletonLock() {
-    let path = "/tmp/doubao-audio-duck.lock"
-    lockFD = open(path, O_CREAT | O_RDWR, 0o644)
-    if lockFD < 0 {
-        log("could not open lock file")
-        return
-    }
-    if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
-        log("another instance holds the lock, exiting")
-        exit(0)
-    }
-}
-
-private func runDaemon() {
-    acquireSingletonLock()
-    log("started pid=\(ProcessInfo.processInfo.processIdentifier) mode=\(DuckController.modeDescription)")
-    // Preserve pre-existing user mute. Only undo mute owned by this instance.
-    writeStatus("idle")
-    let duck = DuckController()
-
-    let names = [
-        "DoubaoImeSettings.asrShortcutRecordingStateNotification",
-        "DoubaoImeSettings.asrShortcutRecordingCaptureNotification",
-        "DoubaoImeSettings.enableStartASRShortcutNotification",
-        "com.bytedance.inputmethod.doubaoime.asrShortcutRecordingStateNotification"
-    ]
-    for name in names {
-        DistributedNotificationCenter.default.addObserver(
-            forName: Notification.Name(name),
-            object: nil,
-            queue: .main
-        ) { note in
-            // Hop onto the input queue: it owns all duck state, and log() must
-            // not be re-entered from two queues at once.
-            duck.queue.async {
-                log("notify \(note.name.rawValue) userInfo=\(note.userInfo ?? [:])")
-                duck.requestSustainSample()
-            }
-        }
-    }
-
-    // Poll supported input-method capture on a dedicated thread. No keyboard
-    // monitoring or window enumeration on the mute path. One scan in flight
-    // bounds the work.
-    let inputThread = Thread {
-        while !Thread.current.isCancelled {
-            duck.queue.sync { duck.requestSustainSample() }
-            usleep(20_000)
-        }
-    }
-    inputThread.name = "com.doubao.audio-duck.capture-poll"
-    inputThread.qualityOfService = .userInteractive
-    inputThread.stackSize = 256 * 1024
-    inputThread.start()
-
-    // If launchd kills or restarts us mid-duck, unmute before dying so the
-    // system never stays silently muted by a dead daemon.
-    signal(SIGTERM, SIG_IGN)
-    signal(SIGINT, SIG_IGN)
-    let srcTerm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-    srcTerm.setEventHandler { duck.emergencyRestore("SIGTERM") }
-    srcTerm.resume()
-    let srcInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    srcInt.setEventHandler { duck.emergencyRestore("SIGINT") }
-    srcInt.resume()
-
-    withExtendedLifetime(inputThread) {
-        RunLoop.main.run()
+    let shortcut = HoldShortcut.load()
+    print("systemMuted=\(systemMuteState().map { String($0) } ?? "unknown")")
+    print(shortcut.summary)
+    print("holdKeys=\(shortcut.keys)")
+    print("holdKeyDown=\(holdKeyDown(shortcut.keys, hid: nil))")
+    print("hidInputMonitoring=\(HIDKeyMonitor.accessDescription)")
+    print("diagnosticProcessPid=\(ProcessInfo.processInfo.processIdentifier) (permission above belongs to this process; daemon fields are in statusFile)")
+    let hid = HIDKeyMonitor()
+    _ = hid.start()
+    print("diagnosticHidStarted=\(hid.started) hidOpenResult=\(hid.openDescription)")
+    print("diagnosticRecognitionMode=\(recognitionMode(hidStarted: hid.started))")
+    print(captureSnapshot().summary)
+    print("capturePollIntervalMs=20 (degraded mode only)")
+    print("duckMode=\(modeDescription)")
+    print("keyPollIntervalMs=5")
+    if let text = try? String(contentsOfFile: statusPath, encoding: .utf8) {
+        print("statusFile=\(text.trimmingCharacters(in: .whitespacesAndNewlines))")
     }
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
 if args.contains("--self-test") {
     runSelfTest()
+} else if args.contains("--grant") {
+    grantAccess()
 } else if args.contains("--dump") || args.contains("--status") {
     dumpDebug()
-    if let text = try? String(contentsOfFile: statusPath, encoding: .utf8) {
-        print("statusFile=\(text.trimmingCharacters(in: .whitespacesAndNewlines))")
-    }
-} else if args.contains("--test-mute") {
-    print("muting 1s…")
-    guard let was = systemMuteState(), setSystemMuted(true) else {
-        print("mute failed: default output device does not expose a writable mute property")
-        exit(1)
-    }
-    Thread.sleep(forTimeInterval: 1.0)
-    if !was && !setSystemMuted(false) {
-        print("restore failed")
-        exit(1)
-    }
-    print("restored")
 } else if args.contains("--probe-keys") {
-    // Diagnostic for the Fn-chord check. CGEventSource.keyState is what lets the
-    // daemon tell "Fn alone" from "Fn+Down": hold a key (or a chord) while this
-    // runs to confirm macOS reports per-key state to this binary.
-    print("sampling key state for 8s — hold the key/chord you want to test…")
-    let deadline = Date().addingTimeInterval(8)
-    var seen: Set<CGKeyCode> = []
-    while Date() < deadline {
-        for code in companionKeyCodes where CGEventSource.keyState(.combinedSessionState, key: code) {
-            if seen.insert(code).inserted { print("  key \(code) reported down") }
+    let shortcut = HoldShortcut.load()
+    print(shortcut.summary)
+    let hid = HIDKeyMonitor()
+    let hidStarted = hid.start()
+    print("hidInput=\(HIDKeyMonitor.accessDescription) hidStarted=\(hidStarted)")
+    print("采样 5 秒，请按住\(shortcut.key == 62 || shortcut.key == 59 ? " Ctrl" : "快捷键 keyCode=\(shortcut.key)")…")
+    let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+    var seen = false
+    var lastPressed: [CGKeyCode] = []
+    while DispatchTime.now().uptimeNanoseconds < deadline {
+        if hid.pressed != lastPressed {
+            lastPressed = hid.pressed
+            print("hidDown=\(lastPressed)")
         }
-        Thread.sleep(forTimeInterval: 0.05)
+        if holdKeyDown(shortcut.keys, hid: hid) && !seen { seen = true; print("holdKeyDown=true") }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.005))
     }
-    if seen.isEmpty {
-        print("no companion key reported (nothing was held, or macOS denies per-key state here)")
-        print("the fast rollback path still works without it")
-    } else {
-        print("keyState works: Fn+<key> chords can be filtered out")
-    }
+    print(seen ? "hold key detected" : "未观察到按键：请确认按的是输入法的按住说话快捷键。")
+} else if args.contains("--test-mute") {
+    acquireSingletonLock()
+    let duck = DuckController(publishStatus: { _ in })
+    print("muting 1s…")
+    duck.update(held: true)
+    Thread.sleep(forTimeInterval: 1)
+    let restored = duck.restoreBeforeExit()
+    print(restored ? "restored" : "restore unconfirmed")
+    exit(restored ? 0 : 1)
 } else if args.contains("--force-unmute") {
-    if setSystemMuted(false) {
-        print("restored")
-    } else {
-        print("restore failed")
-        exit(1)
-    }
+    if setSystemMuted(false) { print("restore requested") }
+    else { print("restore failed"); exit(1) }
 } else {
     runDaemon()
 }
