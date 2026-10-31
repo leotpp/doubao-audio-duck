@@ -11,7 +11,7 @@
 两种触发方式，自动二选一：
 
 1. **认物理键**（首选）：直接读原始 HID 键流，所以连输入法自己吞掉的按住说话键也能看见。
-2. **看麦克风**（降级）：没有「输入监控」权限时，改为监听微信输入法 / 豆包是否正在占用麦克风，占麦即静音，放开即恢复。**不需要任何系统权限。**
+2. **看麦克风**（降级）：没有「输入监控」权限时，改为监听微信输入法 / 豆包是否正在占用麦克风，占麦即静音，放开即恢复。**不需要任何系统权限。** 只看这两个输入法（`com.tencent.inputmethod.wetype`、`com.bytedance.inputmethod.doubaoime`），**其它 App 用麦克风不会触发**。
 
 当前用的是哪种，`--dump` 和状态文件里都有：`recognitionMode=precise-key` 或 `degraded-cg-or-ime-capture`。
 
@@ -57,6 +57,7 @@ private let fallbackHoldKey = CGKeyCode(kVK_RightControl)
 
 ## 现在的限制
 
+- 只认微信输入法和豆包这两个输入法在采麦；会议、录屏、语音备忘录等其它 App 用麦克风**不会**触发静音。
 - **看麦克风模式分不清"真的在说话"和"后台预采麦"**：点麦克风按钮录音也会静音；输入法一直占着麦就一直静音，直到它放开。
 - 只对**默认输出设备**写 mute。设备不暴露 mute 属性（部分外接声卡、AirPlay）就不生效；本机蓝牙音箱已验证可用。
 - 5ms 是采样目标值，不是时延保证：不保证一定先于输入法开麦，也不保证识别不漏字。
@@ -93,4 +94,4 @@ launchctl print "gui/$(id -u)/com.doubao.audio-duck"
 
 Mutes the macOS default output while you hold the push-to-talk key (Right Control by default) and restores the previous mute state on release. Audio keeps playing.
 
-Works with WeType (微信输入法) and Doubao IME. Two triggers, picked automatically: raw HID key events (needs Input Monitoring) or the input method's microphone capture state (needs no permission). With the capture fallback, background pre-capture and click-to-record also mute. The hold key is hard-coded as Right Control (keyCode 62 in `main.swift:8`); edit it — plus the HID usage mapping near line 244 for non-Ctrl keys — and re-run `./install.sh` to change it.
+Works with WeType (微信输入法) and Doubao IME. Two triggers, picked automatically: raw HID key events (needs Input Monitoring) or those two input methods' microphone capture state (needs no permission). Only these two IMEs are watched — other apps using the microphone never trigger it. With the capture fallback, background pre-capture and click-to-record also mute. The hold key is hard-coded as Right Control (keyCode 62 in `main.swift:8`); edit it — plus the HID usage mapping near line 244 for non-Ctrl keys — and re-run `./install.sh` to change it.
