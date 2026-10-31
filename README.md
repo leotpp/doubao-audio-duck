@@ -1,87 +1,79 @@
-# 按键语音静音 · Doubao Audio Duck
+# 语音输入静音 · Push-to-Talk Mute
 
-按住语音输入快捷键时，静音 macOS 默认输出；松开后立即尝试恢复按键前的静音状态。启动时读取微信输入法「按住说话」的快捷键，无法读取或不支持时回退为右 Ctrl（keyCode 62）。音乐、网页视频等继续播放，播放进度不变。
+按住语音输入快捷键（默认**右 Ctrl**）时静音 macOS 系统输出，松开立刻恢复。音乐、网页视频继续播放，进度不回退。它只负责给语音输入腾出一个安静环境，不干预输入法的录音和识别。
 
-Mutes the macOS default output while the push-to-talk key is held and restores its previous mute state on release. Reads WeType's hold shortcut at startup, falling back to Right Control (keyCode 62). Playback continues.
+适配**微信输入法**、**豆包输入法**，以及任何把同一个物理键当「按住说话」的输入法。
 
-非官方个人工具，与字节跳动、腾讯及相关输入法团队无关。
+> 非官方个人工具，与字节跳动、腾讯及相关输入法团队无关。
 
-## 工作方式
+## 它怎么工作
 
-- 约每 5ms 读取一次物理按键状态；首次观察到按下就尝试静音，首次观察到释放就尝试恢复，不额外等待长按确认或 1 秒恢复延时。按键优先从原始 HID 层读取：微信输入法会吞掉自己的按住说话键，普通键盘事件接口看不到它。
-- HID 通道可用时按实体键触发，不要求当前输入源是微信输入法；HID 不可用时自动切换为 **CG keyState 或 WeType/豆包采麦** 降级。两种模式都会明确记录在启动日志和状态文件中。
-- 从 `~/Library/Application Support/WeType/mmkv/wetype.settings` 只读解析「按住说话」配置，不修改输入法设置。支持单键及该键本身的修饰位，暂不支持组合键、多击和 Fn；配置关闭、缺失、损坏或不支持时，在日志记录原因并回退到右 Ctrl。Ctrl 类快捷键同时监听左右两个 keyCode（本机蓝牙键盘把右 Ctrl 上报为 59）。
-- 改快捷键后需重启服务；`--dump` 显示配置读取结果，服务实际采用的键也会在启动日志中记录。
-- 原始 HID 当前仅映射左右 Ctrl（usage `0xE0` / `0xE4`）；其他单键配置仍依赖 CGEventSource，输入法吞键时不能保证识别。此次未扩展键码映射。
-- 降级模式在独立串行队列约每 20ms 查询 CoreAudio 进程列表（`prs#`）、bundle ID（`pbid`）和 running input（`piri`），最多一个查询在途，不阻塞主按键轮询。只匹配 `com.tencent.inputmethod.wetype` / `com.bytedance.inputmethod.doubaoime`，无需新增 TCC 权限；CG 接口仅为辅助，无法可靠识别被输入法吞掉的键。查询失败公开为 `captureAvailable=false` 和 `ERROR`，不能视为健康空闲。
-- **降级的代价：** 后台预采麦、点击麦克风也会静音，可能一直持续到输入法停止采麦；无法从采麦区分实际说话与后台工作。开始/恢复还会受 20ms 目标扫描间隔、HAL 状态和调度延迟影响，不保证与实体键释放同时恢复。HID 可用时不启用采麦降级，不额外增加旧版的 1 秒恢复等待。
-- 保留按键前已有的静音。静音写入成功后，即使回读滞后也保留恢复责任；释放后写入或回读失败，会在后续采样继续重试，确认解除静音后才清除责任。
-- SIGTERM / SIGINT 退出时最多约 0.5 秒尽力恢复，并记录是否确认成功。单实例锁失败时退出，避免多个实例互相争用。
+两种触发方式，自动二选一：
 
-**限制：** 5ms 是目标采样间隔，不是端到端时延保证；键盘上报、进程调度及音频设备都会增加延迟，不能保证先于输入法开麦，也不能保证识别不漏字。该工具不控制输入法的录音或识别流程。
+1. **认物理键**（首选）：直接读原始 HID 键流，所以连输入法自己吞掉的按住说话键也能看见。
+2. **看麦克风**（降级）：没有「输入监控」权限时，改为监听微信输入法 / 豆包是否正在占用麦克风，占麦即静音，放开即恢复。**不需要任何系统权限。**
 
-精确按键模式只覆盖「按住说话」：点麦克风按钮、单击切换录音不会触发；其他应用使用同一个物理键也会静音。释放立即恢复可能使输入法收尾时录到播放声。MMKV 是非公开配置，输入法升级可能使解析失效，届时回退右 Ctrl。降级模式的触发边界与恢复时刻见上方说明。
+当前用的是哪种，`--dump` 和状态文件里都有：`recognitionMode=precise-key` 或 `degraded-cg-or-ime-capture`。
 
-With HID access, the physical hold key triggers mute. Without it, CG key state OR supported IME capture triggers mute; background capture can keep the output muted until capture stops. Failed writes and delayed readback keep restoration pending. Configuration changes require a service restart.
+内部的二进制名 `doubao-audio-duck`、服务名 `com.doubao.audio-duck` 是历史命名，和现在同时支持微信输入法无关，不影响使用。
 
-## 环境与安装
-
-- macOS，已安装 Command Line Tools（`swiftc`）。
-- 输入法的「按住说话」快捷键与本工具监听键一致；当前默认/回退键为右 Ctrl。
-- 默认输出设备需要可读写的 mute 属性；设备类型不参与判断，已验证可写 mute 的蓝牙音箱也可使用。但不保证所有外接声卡、AirPlay 等设备都暴露该属性；不使用音量归零、暂停播放器或其他设备兜底。
-- 原始 HID 需要输入监控权限。启动时仅在未授权时调用 `IOHIDRequestAccess`；系统可能不弹窗，已有拒绝记录时仍需手动处理。请求返回值不等于 GUI 已允许，`unknown` 也不等于 `denied`。
+## 安装
 
 ```bash
 ./install.sh
 ```
 
-安装先编译临时版本并运行自检，通过后才停止旧服务；旧服务必须确认退出时已履行静音恢复责任，才替换二进制并启动服务。安装到 `~/.local/bin/doubao-audio-duck`，登录服务为 `com.doubao.audio-duck`。`DUCK_FN_HOLD_MS` / `DUCK_FN_CONFIRM_MS` 不再生效。
-
-### 输入监控授权与重编译
-
-安装后会检测 daemon 的权限及 HID 打开结果；未就绪时自动打开「系统设置 → 隐私与安全性 → 输入监控」，同时打印准确添加路径。也可主动执行：
+装完即可用（走上面的第 2 种方式）。想让第 1 种方式生效，再给一次权限：
 
 ```bash
 ~/.local/bin/doubao-audio-duck --grant
-```
-
-在该面板允许 `doubao-audio-duck`；若未列出，点击 `+`，按 `⌘⇧G` 输入 **`/Users/你的用户名/.local/bin/doubao-audio-duck`**（使用 `--grant` 打印的绝对路径），添加并打开开关。终端的权限归属可能与 LaunchAgent 不同，应允许这个二进制文件，然后执行下方重启命令。最终以 daemon 的启动日志/状态文件中 `hidInput=granted hidStarted=true` 为准，并在实际文本框中按住再松开右 Ctrl，核对 `hold key down/up` 和 `DUCK begin/end`。
-
-**本工具使用 adhoc/linker 签名，不保证跨重编译保留 TCC 授权。** 当前 designated requirement 绑定 `cdhash`，构建变化可能使原授权失效；未创建自签证书或修改钥匙串。表现为 `hidInput=denied/unknown` 或 `hidStarted=false`、醒目错误和降级模式。即使设置里已有旧条目，重装后也要检查；必要时移除旧条目，再用 `+` 添加当前文件并允许，随后重启。安装后检测与降级用于避免失效时静默空转，不代表授权已持久化。
-
-```bash
+# 在弹出的「系统设置 → 隐私与安全性 → 输入监控」里允许 doubao-audio-duck
 launchctl kickstart -k "gui/$(id -u)/com.doubao.audio-duck"
 ```
 
-## 检查
+注意：本工具是 adhoc 签名，**每次重新编译都可能让这个授权失效**。失效了不影响使用（会自动退回第 2 种方式），想回到精确模式就再授权一次。
 
-```bash
-# 当前输出、启动时将读取的快捷键、当前按键状态、权限与状态文件
-~/.local/bin/doubao-audio-duck --dump
+## 更新记录
 
-# 手动请求输入监控并打开准确设置面板（不会争用单实例锁）
-~/.local/bin/doubao-audio-duck --grant
+- **2026-10-31（当前版本）** —— 触发方式改为「**看输入法有没有在占用麦克风**」：不再依赖系统权限，微信输入法或豆包开始采麦就静音、停止采麦就恢复。同时补上物理键模式的权限申请与明确报错，权限缺失时不会再静默失效（以前的表现就是"按了没反应"）。
+- 2026-09-23 —— 支持微信输入法「按住说话」的快捷键读取。
+- 2026-09-11 —— 豆包输入法开麦即静音。
+- 2026-09-10 —— 静音延迟从 300–700ms 降到约 55ms。
+- 2026-08-31 —— 移除全局 Fn 事件监听，改为按需触发。
+- 2026-08-21 —— 早期基线：按住 Fn 静音、松开恢复。
 
-# 仅采样按键，不静音；5 秒内按住 Ctrl（或读取到的配置键）
-~/.local/bin/doubao-audio-duck --probe-keys
+## 换快捷键（要改代码）
 
-# 使用模拟音频后端验证按键、恢复责任、写入重试与配置解析，不改变系统声音
-~/.local/bin/doubao-audio-duck --self-test
+默认键是**右 Ctrl（keyCode 62），写死在代码里**，位置在 `main.swift` 第 8 行：
 
-# 日志与服务状态
- tail -30 ~/Library/Logs/doubao-audio-duck.log
- launchctl print "gui/$(id -u)/com.doubao.audio-duck"
+```swift
+private let fallbackHoldKey = CGKeyCode(kVK_RightControl)
 ```
 
-`duckMode=hold-key`；本机右 Ctrl 配置应显示 `holdKey=62 source=wetype` 与 `holdKeys=[59, 62]`。`--dump` 的 `hidInputMonitoring` / `diagnosticHidStarted` 属于本次诊断进程，`statusFile` 属于 daemon。状态文件 `/tmp/doubao-audio-duck.status` 保留 `idle`、`ducked hold-key`、`held pre-muted`、`mute-pending` / `restore-pending` 前缀，并附加 `pid`、`hidInput=granted/denied/unknown`、`hidStarted`、`hidOpenResult`、`recognitionMode=precise-key/degraded-cg-or-ime-capture` 与采麦可用性。降级的 `hold key down/up` 表示合并触发状态的变化，不证明观察到了物理键。`captureAvailable=false` 时 CG 仍可能工作，但被吞掉的键无法检测，不能仅凭 `idle` 判断工具有效。授权或设备接入变化后请重启服务以重新打开 HID。
+- 你的输入法「按住说话」绑的是**别的键**，或者你想用蓝牙键盘上的某个键 → 改这一行的 keyCode，然后重跑 `./install.sh`。
+- 如果那个键**不是 Ctrl**，还要在 `main.swift` 的 `HIDKeyMonitor`（约 244 行）里补一条 HID usage 映射。目前只映射了左 Ctrl（`0xE0`）和右 Ctrl（`0xE4`）；不补的话精确模式认不出这个键，只剩"看麦克风"那层有效。
+- 微信输入法的「按住说话」配置如果能读到，会优先按它来（`--dump` 显示 `source=wetype`）；读不到、关闭或格式变化才用上面这个默认键。
+- macOS 的 Fn（Globe）键有特殊性，不推荐绑它。
 
-强制终止（SIGKILL）、进程崩溃、输出设备切换、多输出路由仍不能保证恢复原设备。按住期间手动修改静音状态也无法区分操作意图。异常终止后若仍静音，可手动解除，或执行：
+## 现在的限制
+
+- **看麦克风模式分不清"真的在说话"和"后台预采麦"**：点麦克风按钮录音也会静音；输入法一直占着麦就一直静音，直到它放开。
+- 只对**默认输出设备**写 mute。设备不暴露 mute 属性（部分外接声卡、AirPlay）就不生效；本机蓝牙音箱已验证可用。
+- 5ms 是采样目标值，不是时延保证：不保证一定先于输入法开麦，也不保证识别不漏字。
+- 强制杀进程、崩溃、切换输出设备时，可能来不及恢复静音。
+
+## 诊断
 
 ```bash
-~/.local/bin/doubao-audio-duck --force-unmute
+~/.local/bin/doubao-audio-duck --dump          # 用了哪个键、走哪种模式、权限与状态
+~/.local/bin/doubao-audio-duck --self-test     # 46 条断言自检，不动系统声音
+~/.local/bin/doubao-audio-duck --probe-keys    # 只采样按键，不静音
+~/.local/bin/doubao-audio-duck --force-unmute  # 卡住静音时强制解除
+tail -30 ~/Library/Logs/doubao-audio-duck.log
+launchctl print "gui/$(id -u)/com.doubao.audio-duck"
 ```
 
-手动静音 1 秒的诊断命令 `--test-mute` 只能在服务停止时使用，以免干扰服务持有的恢复状态。
+状态文件 `/tmp/doubao-audio-duck.status` 正常值是 `idle`、`ducked hold-key` 或 `held pre-muted`。
 
 ## 卸载
 
@@ -89,10 +81,16 @@ launchctl kickstart -k "gui/$(id -u)/com.doubao.audio-duck"
 ./uninstall.sh
 ```
 
-现有卸载脚本会强制解除静音，包括原本手动开启的静音；卸载前请留意当前声音状态。
+卸载会强制解除静音（包括你本来手动开的静音），执行前留意当前声音状态。
 
 ## 文件
 
-- `main.swift`：快捷键配置读取、物理按键控制、静音恢复、诊断与自检。
-- `install.sh` / `uninstall.sh`：安装及卸载登录服务。
-- `scratch/trace-fn.swift`：历史 Fn/采麦只读诊断，不参与服务运行。
+- `main.swift`：快捷键读取、物理键 / 采麦触发、静音恢复、诊断与自检。
+- `install.sh` / `uninstall.sh`：安装与卸载登录服务。
+- `scratch/trace-fn.swift`：历史 Fn / 采麦只读诊断，不参与运行。
+
+## English
+
+Mutes the macOS default output while you hold the push-to-talk key (Right Control by default) and restores the previous mute state on release. Audio keeps playing.
+
+Works with WeType (微信输入法) and Doubao IME. Two triggers, picked automatically: raw HID key events (needs Input Monitoring) or the input method's microphone capture state (needs no permission). With the capture fallback, background pre-capture and click-to-record also mute. The hold key is hard-coded as Right Control (keyCode 62 in `main.swift:8`); edit it — plus the HID usage mapping near line 244 for non-Ctrl keys — and re-run `./install.sh` to change it.
