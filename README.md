@@ -35,7 +35,8 @@ launchctl kickstart -k "gui/$(id -u)/com.doubao.audio-duck"
 
 ## 更新记录
 
-- **2026-10-31（当前版本）** —— 触发方式改为「**看输入法有没有在占用麦克风**」：不再依赖系统权限，微信输入法或豆包开始采麦就静音、停止采麦就恢复。同时补上物理键模式的权限申请与明确报错，权限缺失时不会再静默失效（以前的表现就是"按了没反应"）。
+- **2026-11-10（当前版本）** —— 按住说话默认或配置为右 Ctrl 时，**只认右 Ctrl**，**左 Ctrl 普通快捷键不再触发系统静音**；不再把左右 Ctrl 当成同一把键，放弃蓝牙键盘右 Ctrl 报成 59 时的双侧监听兼容。采麦降级未改：HID 不可用时，输入法占麦仍会静音。
+- **2026-10-31** —— 触发方式改为「**看输入法有没有在占用麦克风**」：不再依赖系统权限，微信输入法或豆包开始采麦就静音、停止采麦就恢复。同时补上物理键模式的权限申请与明确报错，权限缺失时不会再静默失效（以前的表现就是"按了没反应"）。
 - 2026-09-23 —— 支持微信输入法「按住说话」的快捷键读取。
 - 2026-09-11 —— 豆包输入法开麦即静音。
 - 2026-09-10 —— 静音延迟从 300–700ms 降到约 55ms。
@@ -67,7 +68,7 @@ private let fallbackHoldKey = CGKeyCode(kVK_RightControl)
 
 ```bash
 ~/.local/bin/doubao-audio-duck --dump          # 用了哪个键、走哪种模式、权限与状态
-~/.local/bin/doubao-audio-duck --self-test     # 57 条断言自检，不动系统声音
+~/.local/bin/doubao-audio-duck --self-test     # 58 条断言自检，不动系统声音
 ~/.local/bin/doubao-audio-duck --probe-keys    # 只采样按键，不静音
 ~/.local/bin/doubao-audio-duck --force-unmute  # 卡住静音时强制解除
 tail -30 ~/Library/Logs/doubao-audio-duck.log

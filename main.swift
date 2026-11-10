@@ -180,8 +180,8 @@ private struct HoldShortcut {
         catch { return HoldShortcut(reason: "cannot read WeType settings") }
     }
 
-    // 本机蓝牙键盘把右 Ctrl 报成 59（实测），左右两侧一起监听才能匹配输入法实际收到的键。
-    var keys: [CGKeyCode] { key == 59 || key == 62 ? [59, 62] : [key] }
+    // 只监听配置的单侧键，避免另一侧 Ctrl 的普通快捷键触发静音。
+    var keys: [CGKeyCode] { [key] }
 
     var summary: String {
         "holdKey=\(key) source=\(source) keyCodes=\(keyCodes.map { String(describing: $0) } ?? "unknown") modifiers=\(modifiers.map { String($0) } ?? "unknown") tapCount=\(tapCount.map { String($0) } ?? "unknown")" + (reason.isEmpty ? "" : " fallbackReason=\(reason)")
@@ -681,7 +681,11 @@ private func runSelfTest() {
     }
     let config = HoldShortcut.decode(fixture())
     expect(config.key == 62 && config.source == "wetype" && config.modifiers == 4096, "right Ctrl configuration was not decoded")
-    expect(config.keys == [59, 62], "Control shortcut should watch both Ctrl sides")
+    expect(config.keys == [62], "right Ctrl shortcut should watch only right Ctrl")
+    let leftControl = HoldShortcut.decode(fixture([
+        ("voicePTTShortcut_keyCodes", stringValue("[59]"))
+    ]))
+    expect(leftControl.source == "wetype" && leftControl.keys == [59], "left Ctrl shortcut should watch only left Ctrl")
     let changed = HoldShortcut.decode(fixture([
         ("voicePTTShortcut_keyCodes", stringValue("[61]")), ("voicePTTShortcut_modifiers", varint(2048))
     ]))
